@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!--
+    Disable user scaling — this is a kiosk display.
+    480 width matches the 3.5" TFT panel exactly.
+  -->
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0,
+                 maximum-scale=1.0, user-scalable=no" />
+  <title>ZeroDay-Edge — AI Network Monitor</title>
+  <meta name="description"
+        content="ZeroDay-Edge: Embedded AI Network Monitor and Zero Trust Gateway for Autonomous Threat Detection" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     APP SHELL  (480 × 320 px)
+     ═══════════════════════════════════════════════════════════════ -->
+<div class="app">
+
+  <!-- ── Header (40 px) ──────────────────────────────────────────────── -->
+  <header class="header">
+    <div class="header-left">
+      <span class="brand"><span class="brand-main">ZeroDay</span><span class="brand-edge">-Edge</span></span>
+      <div class="status-dot" id="status-dot"></div>
+      <span class="status-label">Active</span>
+    </div>
+    <div class="header-right">
+      <span class="rpi-ip" id="rpi-ip">—.—.—.—</span>
+      <span class="clock"  id="clock">00:00:00</span>
+    </div>
+  </header>
+
+  <!-- ── Content Area (228 px) ───────────────────────────────────────── -->
+  <main class="content">
+
+    <!-- ──────────────────────────────────────────────────────────────
+         PAGE 1 · DASHBOARD
+         Layout (228 px total):
+           KPI row         64 px
+           Last threat     54 px
+           Conf bar        22 px
+           Mini feed       88 px
+         ────────────────────────────────────────────────────────── -->
+    <section class="page active" id="p-dashboard" role="main">
+
+      <!-- KPI Cards -->
+      <div class="kpi-row">
+        <div class="kpi-card">
+          <div class="kpi-value" id="kpi-flows">—</div>
+          <div class="kpi-label">Flows</div>
+        </div>
+        <div class="kpi-card threats">
+          <div class="kpi-value" id="kpi-threats">—</div>
+          <div class="kpi-label">Threats</div>
+        </div>
+        <div class="kpi-card blocked">
+          <div class="kpi-value" id="kpi-blocked">—</div>
+          <div class="kpi-label">Blocked</div>
+        </div>
+      </div>
+
+      <!-- Last Threat Panel -->
+      <div class="last-threat" id="last-threat-panel">
+        <div class="panel-eyebrow">Last Threat Detected</div>
+        <div id="last-threat-body">
+          <span class="c-dim" style="font-size:11px">No threats detected yet</span>
+        </div>
+      </div>
+
+      <!-- AI Confidence Bar -->
+      <div class="conf-row">
+        <span class="conf-label">AI Confidence</span>
+        <div class="conf-track">
+          <div class="conf-fill" id="conf-fill" style="width:0%"></div>
+        </div>
+        <span class="conf-pct" id="conf-pct">0%</span>
+      </div>
+
+      <!-- Recent Threats Mini-Feed -->
+      <div class="mini-feed" id="mini-feed">
+        <div class="feed-item">
+          <span class="c-dim" style="font-size:11px">Waiting for traffic…</span>
+        </div>
+      </div>
+
+    </section><!-- /p-dashboard -->
+
+
+    <!-- ──────────────────────────────────────────────────────────────
+         PAGE 2 · ALERTS
+         Shows up to 4 threat alert cards
+         ────────────────────────────────────────────────────────── -->
+    <section class="page" id="p-alerts">
+
+      <div class="page-header">
+        <span class="section-title">Recent Threats</span>
+        <span class="badge" id="alert-badge">0</span>
+      </div>
+
+      <div class="alert-list" id="alert-list">
+        <div class="empty">No threat alerts recorded</div>
+      </div>
+
+    </section><!-- /p-alerts -->
+
+
+    <!-- ──────────────────────────────────────────────────────────────
+         PAGE 3 · NETWORK — Zero Trust IoT Monitor
+         Every connected device is unverified until operator approves.
+         Trust score degrades automatically on each threat detection.
+         ────────────────────────────────────────────────────────── -->
+    <section class="page" id="p-network">
+
+      <div class="page-header">
+        <span class="section-title">Zero Trust Gateway</span>
+        <div class="zt-counts" id="zt-counts">
+          <span class="zt-pill zt-unverified" id="zt-unverified">0 Unverified</span>
+          <span class="zt-pill zt-trusted"    id="zt-trusted">0 Trusted</span>
+          <span class="zt-pill zt-blocked"    id="zt-blocked-ct">0 Blocked</span>
+        </div>
+      </div>
+
+      <!-- Scan / Clear button row -->
+      <div class="zt-toolbar">
+        <span class="zt-desc">All devices untrusted by default. Traffic monitored.</span>
+        <button class="btn-sm" id="btn-scan">Scan</button>
+        <button class="btn-sm btn-danger" id="btn-clear">Clear</button>
+      </div>
+
+      <div class="zt-device-list" id="device-list">
+        <div class="empty">Tap Scan to discover devices on this network</div>
+      </div>
+
+    </section><!-- /p-network -->
+
+
+    <!-- ──────────────────────────────────────────────────────────────
+         PAGE 4 · BLOCKED
+         Currently blocked IPs with one-tap unblock
+         ────────────────────────────────────────────────────────── -->
+    <section class="page" id="p-blocked">
+
+      <div class="page-header">
+        <span class="section-title">Blocked IPs</span>
+        <span class="badge" id="blocked-badge">0</span>
+      </div>
+
+      <div class="blocked-list" id="blocked-list">
+        <div class="empty">No IPs currently blocked</div>
+      </div>
+
+    </section><!-- /p-blocked -->
+
+
+    <!-- ──────────────────────────────────────────────────────────────
+         PAGE 5 · XAI EXPLAINER
+         SHAP feature importance bars for any selected alert
+         ────────────────────────────────────────────────────────── -->
+    <section class="page" id="p-xai">
+
+      <div class="page-header">
+        <span class="section-title">Explain Decision</span>
+      </div>
+
+      <!-- Alert selector -->
+      <div class="xai-select-wrap">
+        <select class="xai-select" id="xai-select" aria-label="Select threat alert">
+          <option value="">Select threat alert…</option>
+        </select>
+      </div>
+
+      <!-- Alert meta (populated after selection) -->
+      <div class="xai-meta" id="xai-meta"></div>
+
+      <!-- SHAP bars -->
+      <div class="xai-bars" id="xai-bars">
+        <div class="empty">Select an alert to see AI explanation</div>
+      </div>
+
+    </section><!-- /p-xai -->
+
+  </main><!-- /content -->
+
+
+  <!-- ── Bottom Navigation (52 px) ──────────────────────────────────── -->
+  <nav class="nav" role="navigation" aria-label="Main navigation">
+
+    <button class="nav-tab active" id="t-dashboard"
+            data-page="dashboard" aria-label="Dashboard">
+      <svg class="nav-icon" width="16" height="16" viewBox="0 0 16 16"
+           fill="none" stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="2" width="5" height="5" rx="1"/>
+        <rect x="9" y="2" width="5" height="5" rx="1"/>
+        <rect x="2" y="9" width="5" height="5" rx="1"/>
+        <rect x="9" y="9" width="5" height="5" rx="1"/>
+      </svg>
+      Home
+    </button>
+
+    <button class="nav-tab" id="t-alerts"
+            data-page="alerts" aria-label="Alerts">
+      <svg class="nav-icon" width="16" height="16" viewBox="0 0 16 16"
+           fill="none" stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M8 2L2 12h12L8 2z"/>
+        <line x1="8" y1="7" x2="8" y2="9.5"/>
+        <circle cx="8" cy="11" r="0.6" fill="currentColor" stroke="none"/>
+      </svg>
+      Alerts
+    </button>
+
+    <button class="nav-tab" id="t-network"
+            data-page="network" aria-label="Network">
+      <svg class="nav-icon" width="16" height="16" viewBox="0 0 16 16"
+           fill="none" stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="8" cy="8" r="2.5"/>
+        <circle cx="8" cy="8" r="6"/>
+        <line x1="8" y1="2" x2="8" y2="14"/>
+        <line x1="2" y1="8" x2="14" y2="8"/>
+      </svg>
+      Network
+    </button>
+
+    <button class="nav-tab" id="t-blocked"
+            data-page="blocked" aria-label="Blocked">
+      <svg class="nav-icon" width="16" height="16" viewBox="0 0 16 16"
+           fill="none" stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="8" cy="8" r="6"/>
+        <line x1="4" y1="4" x2="12" y2="12"/>
+      </svg>
+      Blocked
+    </button>
+
+    <button class="nav-tab" id="t-xai"
+            data-page="xai" aria-label="Explain AI">
+      <svg class="nav-icon" width="16" height="16" viewBox="0 0 16 16"
+           fill="none" stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="7" cy="7" r="4.5"/>
+        <line x1="10.5" y1="10.5" x2="14" y2="14"/>
+        <line x1="7" y1="5" x2="7" y2="7"/>
+        <circle cx="7" cy="9" r="0.5" fill="currentColor" stroke="none"/>
+      </svg>
+      Explain
+    </button>
+
+  </nav><!-- /nav -->
+
+</div><!-- /app -->
+
+<script src="app.js"></script>
+</body>
+</html>
