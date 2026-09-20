@@ -119,6 +119,49 @@ def main():
     METRICS_DIR.mkdir(exist_ok=True)
     plot_training_metrics()
 
+    # Generate separate metric graphs if evaluation_report.json exists
+    eval_report_path = METRICS_DIR / "evaluation_report.json"
+    if eval_report_path.exists():
+        import sys
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        try:
+            from generate_metric_plots import (
+                plot_accuracy,
+                plot_precision,
+                plot_recall,
+                plot_f1_score,
+                plot_specificity,
+                plot_false_positive_rate,
+                plot_confusion_matrix,
+                plot_roc_curve,
+                plot_pr_curve,
+                plot_per_class_metrics,
+                plot_model_comparison,
+                plot_summary_dashboard,
+                setup_matplotlib_style,
+            )
+            setup_matplotlib_style()
+            ev_data = json.loads(eval_report_path.read_text(encoding="utf-8"))
+            print("\nGenerating separate metric graphs from evaluation_report.json...")
+            plot_accuracy(ev_data)
+            plot_precision(ev_data)
+            plot_recall(ev_data)
+            plot_f1_score(ev_data)
+            plot_specificity(ev_data)
+            plot_false_positive_rate(ev_data)
+            plot_confusion_matrix(ev_data)
+            plot_roc_curve(ev_data)
+            plot_pr_curve(ev_data)
+            plot_per_class_metrics(ev_data)
+            plot_feature_importance(ev_data)
+            plot_model_comparison(ev_data)
+            plot_summary_dashboard(ev_data)
+            print("[OK] Separate metric graphs created in metrics/ and metrics/plots/")
+        except Exception as e:
+            print(f"Note: Could not run generate_metric_plots: {e}")
+
     if ARCH_JSON.exists():
         report = json.loads(ARCH_JSON.read_text())
         plot_feature_importance(report)
@@ -131,3 +174,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
