@@ -152,6 +152,23 @@ async function fetchStats() {
   if (fill) fill.style.width = `${(conf * 100).toFixed(0)}%`;
   setText('conf-pct', `${(conf * 100).toFixed(0)}%`);
 
+  // Sniffer status
+  const statusDot = document.getElementById('status-dot');
+  const statusLabel = document.querySelector('.status-label');
+  if (data.capture_running === false) {
+    if (statusDot) statusDot.style.background = 'var(--danger)';
+    if (statusLabel) {
+      statusLabel.textContent = data.capture_error ? `Offline: ${data.capture_error}` : 'Capture Offline';
+      statusLabel.style.color = 'var(--danger)';
+    }
+  } else {
+    if (statusDot) statusDot.style.background = '';
+    if (statusLabel) {
+      statusLabel.textContent = 'Active';
+      statusLabel.style.color = '';
+    }
+  }
+
   // Last threat
   renderLastThreat(data.last_alert);
 }
