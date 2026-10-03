@@ -21,10 +21,14 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+import warnings
 import joblib
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# The scaler was fitted on a DataFrame; we feed ndarrays — harmless, but it floods the console
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 # On a 4GB Pi 4 (vs 8GB Pi 5), RAM is the binding constraint, not CPU.
 # EDGE_LITE_MODE=1 skips the deep-learning stages (Autoencoder/BiLSTM, ~200-400MB

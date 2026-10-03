@@ -9,8 +9,10 @@ Tables:
 """
 
 import sqlite3
+import sys
 import json
 import socket
+import threading
 import time
 import logging
 from datetime import datetime
@@ -24,20 +26,100 @@ DB_PATH = Path(__file__).parent / "rpi_shield.db"
 _PROCESS_START = time.time()
 
 
-# ── Connection ────────────────────────────────────────────────────────────
+# ── Connections ───────────────────────────────────────────────────────────
+# ONE shared SQLite connection for the whole process, serialised by a Python
+# lock. All our threads (Flask workers, sniffer drain, heuristics, ARP scan)
+# live in one process, so SQLite's own file locking was pure overhead — and on
+# a Pi it surfaced as "database is locked" 500s that hung ~30 s then failed.
+# With the lock, a thread that has to wait waits in Python (never errors), and
+# any call holding the DB for >2 s is logged with its name so a stall is easy
+# to attribute.
+#
+# Callers keep the same pattern as before: `conn = _get_conn() ... conn.close()`.
+# _get_conn() takes the lock; close() (or garbage collection of the handle, if
+# a code path forgets) releases it and rolls back any uncommitted leftovers.
 
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+_db_lock = threading.RLock()
+_shared_conn: sqlite3.Connection | None = None
+_depth = 0                # RLock nesting depth (only the outermost close() may rollback)
+_LOCK_WAIT_S = 20
+_SLOW_HOLD_S = 2.0
+
+
+def _open_shared() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")  # better concurrent reads/writes
-    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        logger.info("SQLite journal_mode=%s", mode)
+    except sqlite3.OperationalError as e:
+        logger.warning("Could not enable WAL (%s) - continuing in default mode", e)
+    conn.execute("PRAGMA synchronous=NORMAL")  # fsync on checkpoint only - faster on SD card
+    conn.execute("PRAGMA temp_store=MEMORY")   # temp tables in RAM, not on SD card
     return conn
+
+
+class _Handle:
+    """Lock-holding proxy to the shared connection; close() releases the lock."""
+
+    def __init__(self, caller: str):
+        global _shared_conn, _depth
+        if not _db_lock.acquire(timeout=_LOCK_WAIT_S):
+            raise RuntimeError(f"DB busy: lock not acquired in {_LOCK_WAIT_S}s (caller={caller})")
+        _depth += 1
+        self._held = True
+        self._caller = caller
+        self._t0 = time.time()
+        if _shared_conn is None:
+            _shared_conn = _open_shared()
+        self._c = _shared_conn
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    def close(self):
+        global _depth
+        if not self._held:
+            return
+        self._held = False
+        try:
+            if _depth == 1 and self._c.in_transaction:
+                self._c.rollback()  # discard anything a code path forgot to commit
+        finally:
+            _depth -= 1
+            held = time.time() - self._t0
+            _db_lock.release()
+            if held > _SLOW_HOLD_S:
+                logger.warning("DB held %.1fs by %s (thread %s)", held, self._caller,
+                               threading.current_thread().name)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def _get_conn() -> "_Handle":
+    return _Handle(sys._getframe(1).f_code.co_name)
+
+
+def _enable_wal():
+    """Kept for callers/tests; the shared connection enables WAL when it opens."""
+    _get_conn().close()
 
 
 # ── Schema Init ───────────────────────────────────────────────────────────
 
 def init_db():
     """Create tables if they don't exist. Safe to call multiple times."""
+    _enable_wal()
     conn = _get_conn()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS threat_alerts (
@@ -192,7 +274,16 @@ def remove_blocked_ip(ip: str):
 def get_blocked_ips() -> list[dict]:
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM blocked_ips ORDER BY blocked_at DESC")
+    c.execute("""
+        SELECT b.*,
+               (SELECT threat_class FROM threat_alerts a WHERE a.source_ip = b.ip
+                  AND LOWER(a.threat_class) NOT IN ('benign','normal') ORDER BY a.id DESC LIMIT 1) AS threat_class,
+               (SELECT confidence FROM threat_alerts a WHERE a.source_ip = b.ip
+                  AND LOWER(a.threat_class) NOT IN ('benign','normal') ORDER BY a.id DESC LIMIT 1) AS confidence,
+               (SELECT detected_by FROM threat_alerts a WHERE a.source_ip = b.ip
+                  AND LOWER(a.threat_class) NOT IN ('benign','normal') ORDER BY a.id DESC LIMIT 1) AS detected_by
+        FROM blocked_ips b ORDER BY b.id DESC
+    """)
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows

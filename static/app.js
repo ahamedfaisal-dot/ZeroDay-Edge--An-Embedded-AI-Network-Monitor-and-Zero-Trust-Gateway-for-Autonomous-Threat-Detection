@@ -31,7 +31,9 @@ const API = {
 
 /* ── State ────────────────────────────────────────────────────────────── */
 let activePage = 'dashboard';
-let threatAlerts = [];   // cached for XAI dropdown population
+let threatAlerts = [];
+let blockedCache = [];   // last /api/blocked payload, painted instantly on tab switch
+let blockedSeq = 0;      // drops out-of-order responses   // cached for XAI dropdown population
 
 /* ── Utilities ────────────────────────────────────────────────────────── */
 function esc(s) {
@@ -124,7 +126,7 @@ function switchPage(page) {
 
   // Trigger immediate data refresh for newly visible page
   if (page === 'alerts')  renderAlerts(threatAlerts);
-  if (page === 'blocked') fetchBlocked();
+  if (page === 'blocked') { renderBlocked(blockedCache); fetchBlocked(); }
   if (page === 'network') fetchNetwork();
   if (page === 'xai')     populateXaiSelect();
 }
@@ -265,7 +267,7 @@ function renderAlerts(data) {
   }
 
   // Show up to 4 cards in the 228px content area
-  el.innerHTML = data.slice(0, 4).map(a => {
+  el.innerHTML = data.map(a => {
     const conf  = fmtPct(a.confidence);
     const col   = threatColour(a.threat_class);
     const time  = fmtTime(a.timestamp);
@@ -313,7 +315,7 @@ async function fetchNetwork() {
     return;
   }
 
-  el.innerHTML = data.slice(0, 4).map(d => {
+  el.innerHTML = data.map(d => {
     const score  = Number(d.trust_score) || 0;
     const scoreW = score.toFixed(0) + '%';
     const fillCls = score >= 60 ? 'high' : score >= 30 ? 'med' : 'low';
@@ -393,9 +395,14 @@ document.getElementById('btn-clear')?.addEventListener('click', async () => {
 /* ══════════════════════════════════════════════════════════════════════ */
 
 async function fetchBlocked() {
+  const seq = ++blockedSeq;
   const data = await fetchJSON(API.blocked);
-  if (!data) return;
+  if (!data || seq !== blockedSeq) return;   // failed, or a newer request superseded this one
+  blockedCache = data;
+  renderBlocked(data);
+}
 
+function renderBlocked(data) {
   const badge = document.getElementById('blocked-badge');
   if (badge) {
     badge.textContent = data.length;
@@ -412,18 +419,31 @@ async function fetchBlocked() {
     return;
   }
 
-  el.innerHTML = data.map(b => {
-    const type = b.auto_blocked ? 'AUTO' : 'MANUAL';
-    const time = fmtTime(b.blocked_at);
-    return `<div class="blocked-row">
-      <span class="blocked-ip">${esc(b.ip)}</span>
-      <span class="block-type">${type}</span>
-      <span class="block-time">${time}</span>
-      <button class="btn-unblock" data-ip="${escAttr(b.ip)}">Unblock</button>
-    </div>`;
-  }).join('');
+  try {
+    el.innerHTML = data.map(b => {
+      const type = b.auto_blocked ? 'AUTO' : 'MANUAL';
+      const time = fmtTime(b.blocked_at);
+      const threat = b.threat_class
+        ? `<span class="block-threat">${esc(b.threat_class)} · ${fmtPct(b.confidence)}${b.detected_by ? ' · ' + esc(b.detected_by) : ''}</span>`
+        : `<span class="block-threat">${esc(b.reason || '')}</span>`;
+      return `<div class="blocked-row">
+        <div class="blocked-main">
+          <div class="blocked-top">
+            <span class="blocked-ip">${esc(b.ip)}</span>
+            <span class="block-type">${type}</span>
+            <span class="block-time">${time}</span>
+          </div>
+          ${threat}
+        </div>
+        <button class="btn-unblock" data-ip="${escAttr(b.ip)}">Unblock</button>
+      </div>`;
+    }).join('');
+  } catch (err) {
+    console.error('renderBlocked failed', err);
+    el.innerHTML = '<div class="empty">Could not render blocked list</div>';
+    return;
+  }
 
-  // Bind unblock buttons
   el.querySelectorAll('.btn-unblock').forEach(btn => {
     btn.addEventListener('click', async () => {
       const ip = btn.dataset.ip;
@@ -434,8 +454,7 @@ async function fetchBlocked() {
       } catch (err) {
         console.error('Failed to unblock:', err);
       }
-      await fetchBlocked();
-      await fetchStats();
+      await Promise.all([fetchBlocked(), fetchStats()]);
     });
   });
 }

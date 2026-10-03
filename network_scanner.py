@@ -694,7 +694,7 @@ class NetworkScanner:
             if n_ports >= _SCAN_PORT_THRESHOLD and avg_pkts_per_port < _SCAN_MAX_AVG_PKTS_PER_PORT:
                 if not self._cooldown_ok(("scan", src, dst), now):
                     continue
-                confidence = min(n_ports / (_SCAN_PORT_THRESHOLD * 4), 1.0)
+                confidence = min(0.80 + (n_ports / (_SCAN_PORT_THRESHOLD * 2)) * 0.20, 1.0)
                 alerts.append({
                     "source_ip": src,
                     "dest_ip": dst,

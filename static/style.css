@@ -501,7 +501,8 @@ html, body {
 
 .alert-list {
   flex: 1;
-  overflow: hidden;
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -632,7 +633,8 @@ html, body {
 /* Device list container */
 .zt-device-list {
   flex: 1;
-  overflow: hidden;
+  overflow-y: auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -775,7 +777,8 @@ html, body {
 
 .blocked-list {
   flex: 1;
-  overflow: hidden;
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -798,6 +801,16 @@ html, body {
   font-weight: 600;
   color: var(--danger);
   flex: 1;
+}
+
+.blocked-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.blocked-top  { display: flex; align-items: center; gap: 8px; }
+.block-threat {
+  font-size: 10px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .block-type {

@@ -48,6 +48,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 import db
+import firewall as fw
 from ml_engine import MLEngine
 from network_scanner import NetworkScanner, is_protected_ip
 
@@ -62,6 +63,7 @@ logger = logging.getLogger("cybershield")
 # ── App Setup ─────────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0  # always revalidate JS/CSS after a redeploy
 
 # ── Service Initialisation ────────────────────────────────────────────────
 db.init_db()
@@ -75,90 +77,30 @@ threading.Thread(target=ml.load, daemon=True, name="ml-loader").start()
 
 # ── iptables Helpers ──────────────────────────────────────────────────────
 
-def _ensure_safeguard_rules():
-    """
-    Ensure management ports (Dashboard :5000 and SSH :22) are explicitly ACCEPTed
-    at the very top of iptables INPUT chain so an auto-block on an attacker IP
-    (especially during demos run from the operator's PC) never severs the dashboard
-    or SSH session!
-    """
-    flask_port = os.environ.get("EDGE_PORT", "5000")
-    for port in (flask_port, "22"):
-        try:
-            cmd_check = ["iptables", "-C", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"]
-            cmd_insert = ["iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"]
-            if hasattr(os, "geteuid") and os.geteuid() != 0:
-                p = subprocess.run(["sudo", "-S"] + cmd_check, input=b"pi\n", capture_output=True)
-                if p.returncode != 0:
-                    subprocess.run(["sudo", "-S"] + cmd_insert, input=b"pi\n", capture_output=True)
-            else:
-                p = subprocess.run(cmd_check, capture_output=True)
-                if p.returncode != 0:
-                    subprocess.run(cmd_insert, capture_output=True)
-        except Exception as e:
-            logger.debug("Safeguard rule error: %s", e)
-
-_ensure_safeguard_rules()
-
-def _iptables(action: str, ip: str) -> bool:
-    """
-    Add or remove an iptables INPUT DROP rule for `ip`.
-
-    action: '-A' (append) | '-D' (delete)
-    Returns True on success, False on failure.
-    """
-    try:
-        is_root = False
-        try:
-            is_root = (os.geteuid() == 0)
-        except AttributeError:
-            pass
-
-        if is_root:
-            subprocess.run(
-                ["iptables", action, "INPUT", "-s", ip, "-j", "DROP"],
-                check=True,
-                capture_output=True,
-                timeout=5,
-            )
-        else:
-            subprocess.run(
-                ["sudo", "-S", "iptables", action, "INPUT", "-s", ip, "-j", "DROP"],
-                input=b"pi\n",
-                check=True,
-                capture_output=True,
-                timeout=5,
-            )
-        return True
-    except FileNotFoundError:
-        logger.warning("iptables not found — block/unblock is DB-only (simulation mode)")
-        return False
-    except subprocess.CalledProcessError as e:
-        logger.warning("iptables %s %s failed: %s", action, ip, e.stderr.decode())
-        return False
-    except Exception as e:
-        logger.error("iptables error: %s", e)
-        return False
-
-
 def _block_ip(ip: str, reason: str = "auto", auto: bool = True) -> bool:
     if auto and is_protected_ip(ip):
         logger.warning("Refusing to auto-block protected IP %s (%s)", ip, reason)
         return False
+    enforced = fw.block(ip)  # idempotent: never stacks duplicate rules
     if not db.is_ip_blocked(ip):
-        _iptables("-A", ip)
         db.add_blocked_ip(ip, reason=reason, auto=auto)
-        logger.info("Blocked %s (%s)", ip, reason)
+    logger.info("Blocked %s (%s) — firewall[%s] %s", ip, reason, fw.BACKEND,
+                "ENFORCED" if enforced else "NOT enforced (DB only)")
     return True
 
 
-def _unblock_ip(ip: str):
-    # Repeat -D up to 20 times to thoroughly purge any duplicate iptables rules
-    for _ in range(20):
-        if not _iptables("-D", ip):
-            break
+def _unblock_ip(ip: str) -> bool:
+    cleared = fw.unblock(ip)  # removes every copy of the rule
     db.remove_blocked_ip(ip)
-    logger.info("Unblocked %s (all iptables rules purged)", ip)
+    logger.info("Unblocked %s — firewall[%s] %s", ip, fw.BACKEND,
+                "cleared" if cleared else "clear FAILED / DB only")
+    return cleared
+
+
+# Firewall: management-port safeguards first, then re-apply blocks recorded in
+# the DB (rules do not survive a reboot / service restart).
+fw.setup()
+fw.restore([b["ip"] for b in db.get_blocked_ips()])
 
 
 # ── Classification Helper ─────────────────────────────────────────────────
@@ -313,6 +255,7 @@ def index():
 def api_health():
     """Capture/ML liveness — first stop when detection looks dead."""
     return jsonify({
+        "firewall_backend": fw.BACKEND,
         "capture": scanner.capture_health(),
         "ml_loaded": ml._loaded,
         "ml_stages": {
@@ -364,8 +307,8 @@ def api_clear():
     """Wipe all alerts/flows/blocked IPs/device registry — dashboard 'Clear Data' button."""
     blocked_ips = db.clear_all()
     for ip in blocked_ips:
-        _iptables("-D", ip)
-    logger.info("Dashboard: data cleared (%d iptables rules removed)", len(blocked_ips))
+        fw.unblock(ip)
+    logger.info("Dashboard: data cleared (%d firewall blocks removed)", len(blocked_ips))
     return jsonify({
         "status": "cleared",
         "unblocked_ips": len(blocked_ips),
@@ -409,6 +352,7 @@ def api_block(ip: str):
     _block_ip(ip, reason="manual", auto=False)
     return jsonify({
         "status":    "blocked",
+        "enforced":  fw.is_blocked(ip),
         "ip":        ip,
         "timestamp": datetime.utcnow().isoformat(),
     })
@@ -417,9 +361,10 @@ def api_block(ip: str):
 @app.route("/api/unblock/<ip>", methods=["POST", "GET"])
 def api_unblock(ip: str):
     """Manually unblock an IP."""
-    _unblock_ip(ip)
+    cleared = _unblock_ip(ip)
     return jsonify({
         "status":    "unblocked",
+        "firewall_cleared": cleared,
         "ip":        ip,
         "timestamp": datetime.utcnow().isoformat(),
     })
