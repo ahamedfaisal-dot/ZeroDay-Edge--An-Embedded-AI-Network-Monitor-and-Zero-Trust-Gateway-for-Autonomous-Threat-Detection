@@ -64,12 +64,27 @@ def _iptables(action: str, ip: str) -> bool:
     Returns True on success, False on failure.
     """
     try:
-        subprocess.run(
-            ["sudo", "iptables", action, "INPUT", "-s", ip, "-j", "DROP"],
-            check=True,
-            capture_output=True,
-            timeout=5,
-        )
+        is_root = False
+        try:
+            is_root = (os.geteuid() == 0)
+        except AttributeError:
+            pass
+
+        if is_root:
+            subprocess.run(
+                ["iptables", action, "INPUT", "-s", ip, "-j", "DROP"],
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
+        else:
+            subprocess.run(
+                ["sudo", "-S", "iptables", action, "INPUT", "-s", ip, "-j", "DROP"],
+                input=b"pi\n",
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
         return True
     except FileNotFoundError:
         logger.warning("iptables not found — block/unblock is DB-only (simulation mode)")
@@ -255,8 +270,14 @@ def api_health():
 
 @app.route("/api/stats")
 def api_stats():
-    """Aggregate KPI numbers for the dashboard."""
-    return jsonify(db.get_stats())
+    """Aggregate KPI numbers for the dashboard, including real-time sniffer health."""
+    stats = db.get_stats()
+    health = scanner.capture_health()
+    stats["capture_running"] = health["capture_running"]
+    stats["capture_error"] = health.get("error_message")
+    stats["capture_iface"] = health.get("interface")
+    stats["packets_seen"] = health.get("packets_seen", 0)
+    return jsonify(stats)
 
 
 @app.route("/api/alerts")
