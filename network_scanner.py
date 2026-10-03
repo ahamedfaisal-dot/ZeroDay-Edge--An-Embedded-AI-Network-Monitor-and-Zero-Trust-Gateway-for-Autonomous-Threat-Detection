@@ -390,9 +390,9 @@ _MAX_FLOW_TABLE_ENTRIES = 4000
 # representation.
 # Key: (src_ip, dst_ip) — Value: {"ports": set(), "pkts": int, "bytes": int, "start": float}
 _scan_table: dict = defaultdict(lambda: {"ports": set(), "pkts": 0, "bytes": 0, "start": time.time()})
-_SCAN_PORT_THRESHOLD = 15        # distinct dst ports from one src to one dst within a window = scan
+_SCAN_PORT_THRESHOLD = 10        # distinct dst ports from one src to one dst within a window = scan (lowered to 10)
 _SCAN_MAX_AVG_PKTS_PER_PORT = 5  # below this density, high port count = scan, not flood
-_FLOOD_PACKET_THRESHOLD = 120    # packets from one src to one dst within a window = flood/DDoS (calibrated for test runs)
+_FLOOD_PACKET_THRESHOLD = 100    # packets from one src to one dst within a window = flood/DDoS (calibrated for test runs)
 
 # ── Brute-force tracker ────────────────────────────────────────────────────
 # Repeated login/connection attempts at ONE port look like the scan case —
@@ -401,9 +401,9 @@ _FLOOD_PACKET_THRESHOLD = 120    # packets from one src to one dst within a wind
 # across many. Counts fresh SYNs (SYN without ACK = a new connection
 # attempt, not a response) per (src, dst, dst_port).
 _bruteforce_table: dict = defaultdict(lambda: {"attempts": 0, "start": time.time()})
-_BRUTEFORCE_ATTEMPT_THRESHOLD = 8   # connection attempts to the same dst:port within a window
-_TRACKER_WINDOW_SECONDS = 5         # sliding window for scan/flood/brute-force trackers
-_HEURISTIC_COOLDOWN_SECONDS = 5     # cooldown before re-alerting same source/attack type (5s for quick testing)
+_BRUTEFORCE_ATTEMPT_THRESHOLD = 6   # connection attempts to the same dst:port within a window
+_TRACKER_WINDOW_SECONDS = 8         # sliding window for scan/flood/brute-force trackers (expanded to 8s for multi-second scans)
+_HEURISTIC_COOLDOWN_SECONDS = 2     # cooldown before re-alerting (reduced to 2s so back-to-back testing works reliably)
 _heuristic_last_alert: dict = {}
 
 _capture_stats = {"packets": 0, "raw_packets": 0, "errors": 0, "last_packet": 0.0, "started": False, "iface": None}
