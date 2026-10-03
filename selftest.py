@@ -36,7 +36,7 @@ def check(name, cond, detail=""):
 
 def send(src, dst, sport, dport, flags="S", payload=b"", n=1):
     for _ in range(n):
-        sc._handle_packet(IP(bytes(IP(src=src, dst=dst) / TCP(sport=sport, dport=dport, flags=flags) / Raw(payload))))
+        sc._handle_packet(IP(src=src, dst=dst) / TCP(sport=sport, dport=dport, flags=flags) / Raw(payload))
 
 
 def reset():
