@@ -65,19 +65,37 @@ def _get_local_ip() -> str:
         s.close()
         return ip
     except Exception:
-        return "127.0.0.1"
+        pass
+
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2).stdout
+        for ip in out.split():
+            if not ip.startswith("127.") and ":" not in ip:
+                return ip
+    except Exception:
+        pass
+
+    return "127.0.0.1"
 
 
 LOCAL_IP = _get_local_ip()
 
 
 def _get_gateway_ip() -> str | None:
-    """Default gateway from /proc/net/route (Linux); None elsewhere."""
+    """Default gateway from /proc/net/route or ip route (Linux); None elsewhere."""
+    try:
+        out = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True, timeout=2).stdout
+        m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+
     try:
         with open("/proc/net/route") as f:
             for line in f.readlines()[1:]:
                 p = line.split()
-                if p[1] == "00000000":
+                if len(p) >= 2 and p[1] == "00000000":
                     return socket.inet_ntoa(bytes.fromhex(p[2])[::-1])
     except Exception:
         pass
@@ -252,6 +270,12 @@ class _FlowStats:
         src_ip = self.initiator[0] if self.initiator else "0.0.0.0"
         dst_ip = self.peer_ip or "0.0.0.0"
 
+        # IAT min: if only one packet in a direction, no inter-arrival time was
+        # recorded (rs.n == 0).  Use 0 rather than the uninitialised default.
+        fwd_iat_min = self.fwd_iat.min if self.fwd_iat.n > 0 else 0.0
+        bwd_iat_min = self.bwd_iat.min if self.bwd_iat.n > 0 else 0.0
+        flow_iat_min = self.flow_iat.min if self.flow_iat.n > 0 else 0.0
+
         return {
             "source_ip": src_ip,
             "destination_ip": dst_ip,
@@ -270,11 +294,11 @@ class _FlowStats:
             "TotLen Fwd Pkts": self.fwd_bytes,
             "TotLen Bwd Pkts": self.bwd_bytes,
             "Fwd Pkt Len Max": self.fwd_len.max,
-            "Fwd Pkt Len Min": self.fwd_len.min,
+            "Fwd Pkt Len Min": self.fwd_len.min if self.fwd_len.n > 0 else 0.0,
             "Fwd Pkt Len Mean": self.fwd_len.mean,
             "Fwd Pkt Len Std": self.fwd_len.std,
             "Bwd Pkt Len Max": self.bwd_len.max,
-            "Bwd Pkt Len Min": self.bwd_len.min,
+            "Bwd Pkt Len Min": self.bwd_len.min if self.bwd_len.n > 0 else 0.0,
             "Bwd Pkt Len Mean": self.bwd_len.mean,
             "Bwd Pkt Len Std": self.bwd_len.std,
             "Flow Byts/s": total_bytes / duration_s,
@@ -282,17 +306,17 @@ class _FlowStats:
             "Flow IAT Mean": self.flow_iat.mean,
             "Flow IAT Std": self.flow_iat.std,
             "Flow IAT Max": self.flow_iat.max,
-            "Flow IAT Min": self.flow_iat.min,
+            "Flow IAT Min": flow_iat_min,
             "Fwd IAT Tot": self.fwd_iat.total,
             "Fwd IAT Mean": self.fwd_iat.mean,
             "Fwd IAT Std": self.fwd_iat.std,
             "Fwd IAT Max": self.fwd_iat.max,
-            "Fwd IAT Min": self.fwd_iat.min,
+            "Fwd IAT Min": fwd_iat_min,
             "Bwd IAT Tot": self.bwd_iat.total,
             "Bwd IAT Mean": self.bwd_iat.mean,
             "Bwd IAT Std": self.bwd_iat.std,
             "Bwd IAT Max": self.bwd_iat.max,
-            "Bwd IAT Min": self.bwd_iat.min,
+            "Bwd IAT Min": bwd_iat_min,
             "Fwd PSH Flags": self.fwd_psh_cnt,
             "Bwd PSH Flags": self.bwd_psh_cnt,
             "Fwd URG Flags": self.fwd_urg_cnt,
@@ -301,7 +325,7 @@ class _FlowStats:
             "Bwd Header Len": self.bwd_header_bytes,
             "Fwd Pkts/s": self.fwd_pkts / duration_s,
             "Bwd Pkts/s": self.bwd_pkts / duration_s,
-            "Pkt Len Min": self.pkt_len.min,
+            "Pkt Len Min": self.pkt_len.min if self.pkt_len.n > 0 else 0.0,
             "Pkt Len Max": self.pkt_len.max,
             "Pkt Len Mean": self.pkt_len.mean,
             "Pkt Len Std": self.pkt_len.std,
@@ -312,10 +336,20 @@ class _FlowStats:
             "PSH Flag Cnt": self.psh_cnt,
             "ACK Flag Cnt": self.ack_cnt,
             "URG Flag Cnt": self.urg_cnt,
+            # CWE and ECE are uncommon; 0 is correct for most live traffic.
+            "CWE Flag Count": 0,
+            "ECE Flag Cnt": 0,
             "Down/Up Ratio": (self.bwd_pkts / self.fwd_pkts) if self.fwd_pkts else 0.0,
             "Pkt Size Avg": (total_bytes / total_pkts) if total_pkts else 0.0,
             "Fwd Seg Size Avg": self.fwd_len.mean,
             "Bwd Seg Size Avg": self.bwd_len.mean,
+            # Bulk transfer stats — 0 for interactive/streaming sessions.
+            "Fwd Byts/b Avg": 0,
+            "Fwd Pkts/b Avg": 0,
+            "Fwd Blk Rate Avg": 0,
+            "Bwd Byts/b Avg": 0,
+            "Bwd Pkts/b Avg": 0,
+            "Bwd Blk Rate Avg": 0,
             "Subflow Fwd Pkts": self.fwd_pkts,
             "Subflow Fwd Byts": self.fwd_bytes,
             "Subflow Bwd Pkts": self.bwd_pkts,
@@ -324,6 +358,15 @@ class _FlowStats:
             "Init Bwd Win Byts": self.init_bwd_win if self.init_bwd_win is not None else -1,
             "Fwd Act Data Pkts": self.fwd_data_pkts,
             "Fwd Seg Size Min": self.min_fwd_header_bytes or 0,
+            # Active/Idle: 0 = single uninterrupted session (correct default).
+            "Active Mean": 0,
+            "Active Std": 0,
+            "Active Max": 0,
+            "Active Min": 0,
+            "Idle Mean": 0,
+            "Idle Std": 0,
+            "Idle Max": 0,
+            "Idle Min": 0,
         }
 
 
@@ -363,7 +406,7 @@ _TRACKER_WINDOW_SECONDS = 5          # sliding window for scan/flood/brute-force
 _HEURISTIC_COOLDOWN_SECONDS = 10     # don't re-alert the same (type, src, dst) more often than this
 _heuristic_last_alert: dict = {}
 
-_capture_stats = {"packets": 0, "errors": 0, "last_packet": 0.0, "started": False, "iface": None}
+_capture_stats = {"packets": 0, "raw_packets": 0, "errors": 0, "last_packet": 0.0, "started": False, "iface": None}
 
 # ARP scan results cache
 _devices_cache: list[dict] = []
@@ -398,43 +441,123 @@ class NetworkScanner:
 
     # ── Packet Capture ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _default_iface() -> str | None:
+        """Interface of the default route — what actually carries LAN traffic."""
+        # 1. Environment override
+        env_iface = os.environ.get("EDGE_IFACE")
+        if env_iface:
+            return env_iface
+
+        # 2. Linux ip route get (standard on Raspberry Pi OS Bookworm / Debian)
+        try:
+            out = subprocess.run(
+                ["ip", "route", "get", "8.8.8.8"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout
+            m = re.search(r"dev\s+(\S+)", out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+
+        # 3. Linux ip route default
+        try:
+            out = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout
+            m = re.search(r"dev\s+(\S+)", out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+
+        # 4. /proc/net/route fallback
+        try:
+            with open("/proc/net/route") as f:
+                for line in f.readlines()[1:]:
+                    p = line.split()
+                    if len(p) >= 2 and p[1] == "00000000":
+                        return p[0]
+        except Exception:
+            pass
+
+        # 5. Scapy conf.iface fallback
+        try:
+            from scapy.all import conf
+            if conf.iface and getattr(conf.iface, "name", None) not in (None, "lo"):
+                return conf.iface.name
+        except Exception:
+            pass
+
+        # 6. Check common Pi network interfaces (/sys/class/net)
+        try:
+            from pathlib import Path
+            for iface in ("wlan0", "eth0", "end0"):
+                op = Path(f"/sys/class/net/{iface}/operstate")
+                if op.exists() and op.read_text().strip() == "up":
+                    return iface
+        except Exception:
+            pass
+
+        return None
+
     def start_capture(self):
         """
-        Start blocking Scapy packet sniff. Call from a daemon thread.
-        Silently no-ops if Scapy is unavailable.
+        Blocking Scapy sniff, restarted automatically if it dies. Call from a
+        daemon thread. Tries (iface, BPF 'ip' filter) first, then falls back to
+        no BPF filter (IPv4 filtering done in _handle_packet).
         """
         if not SCAPY_AVAILABLE:
+            _capture_stats["started"] = False
+            _capture_stats["error_message"] = "Scapy not installed"
             logger.info("Capture disabled — running in passive/manual-ingest mode")
             return
 
-        self._sniff_running = True
-        _capture_stats["started"] = True
-        _capture_stats["iface"] = self.interface or "auto"
-        logger.info("Starting packet capture (interface=%s)…", self.interface or "auto")
-
-        kwargs: dict = {
-            "prn":    self._handle_packet,
-            "store":  False,
-            "filter": "ip",          # only IPv4
-        }
-        if self.interface:
-            kwargs["iface"] = self.interface
-
-        try:
-            sniff(**kwargs)  # blocks forever
-        except PermissionError:
-            _capture_stats["started"] = False
-            logger.error(
-                "Packet capture requires root privileges. "
-                "Run with: sudo python app.py"
-            )
-        except Exception as e:
-            _capture_stats["started"] = False
-            logger.error("Capture error: %s", e)
+        iface = self.interface or self._default_iface()
+        attempts = [(iface, "ip"), (iface, None)]
+        if not iface:
+            attempts.append((None, None))
+        i = 0
+        while True:
+            iface_try, bpf = attempts[min(i, len(attempts) - 1)]
+            _capture_stats["started"] = True
+            _capture_stats["iface"] = iface_try or "auto"
+            logger.info("Starting packet capture (iface=%s, filter=%s)…", iface_try or "auto", bpf or "none")
+            kwargs: dict = {"prn": self._handle_packet, "store": False, "promisc": True}
+            if bpf:
+                kwargs["filter"] = bpf
+            if iface_try:
+                kwargs["iface"] = iface_try
+            started = time.time()
+            try:
+                _capture_stats["error_message"] = None
+                sniff(**kwargs)  # blocks until failure
+                logger.warning("sniff() returned unexpectedly — restarting")
+            except (PermissionError, OSError) as e:
+                _capture_stats["started"] = False
+                err_text = str(e)
+                if isinstance(e, PermissionError) or getattr(e, "errno", None) == 1 or "Operation not permitted" in err_text:
+                    _capture_stats["error_message"] = "Root required (run with sudo)"
+                    logger.error("Packet capture requires root permissions: %s. Run with: sudo bash start.sh", e)
+                else:
+                    _capture_stats["error_message"] = f"Capture error: {e}"
+                    logger.exception("Capture error (iface=%s filter=%s): %s", iface_try, bpf, e)
+                time.sleep(5)
+            except Exception as e:
+                _capture_stats["started"] = False
+                _capture_stats["error_message"] = f"Capture error: {e}"
+                logger.exception("Capture error (iface=%s filter=%s): %s", iface_try, bpf, e)
+                time.sleep(2)
+            # Ran a while before dying = transient; failed instantly = try next fallback
+            i = 0 if time.time() - started > 30 else i + 1
+            time.sleep(2)
 
     def _handle_packet(self, pkt):
         """Scapy callback — accumulate per-flow CIC-IDS-2017-style stats from each IP packet."""
         try:
+            _capture_stats["raw_packets"] += 1
             if not pkt.haslayer(IP):
                 return
 
@@ -452,6 +575,11 @@ class NetworkScanner:
 
             tcp_layer = pkt[TCP] if pkt.haslayer(TCP) else None
             udp_layer = pkt[UDP] if pkt.haslayer(UDP) else None
+
+            # Filter out Flask web dashboard management traffic (default port 5000)
+            flask_port = int(os.environ.get("EDGE_PORT", "5000"))
+            if tcp_layer is not None and (tcp_layer.sport == flask_port or tcp_layer.dport == flask_port):
+                return
 
             if tcp_layer is not None:
                 sport, dport = tcp_layer.sport, tcp_layer.dport
@@ -502,7 +630,9 @@ class NetworkScanner:
             "capture_running": _capture_stats["started"],
             "interface": _capture_stats["iface"],
             "packets_seen": _capture_stats["packets"],
+            "raw_packets_seen": _capture_stats["raw_packets"],
             "handler_errors": _capture_stats["errors"],
+            "error_message": _capture_stats.get("error_message"),
             "seconds_since_last_packet": round(time.time() - last, 1) if last else None,
             "local_ip": LOCAL_IP,
             "protected_ips": sorted(PROTECTED_IPS),

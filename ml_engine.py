@@ -79,18 +79,31 @@ _KEY_MAP = {
 }
 
 _AUTO_BLOCK_THRESHOLD = 0.85
-_TREE_PROB_THRESHOLD = float(os.environ.get("EDGE_TREE_THRESHOLD", "0.6"))  # mean P(malicious) needed
+# Mean P(malicious) threshold: both models must agree above this.
+# XGBoost alone can register high P(malicious) on sparse/zero feature vectors
+# (it learned that "no backward window" = attack-like), so we require RF to
+# also be at least 0.40 before flagging as a threat.  The XGB-only-high path
+# is deliberately kept at an aggressive 0.90 to catch very obvious attacks.
+_TREE_PROB_THRESHOLD = float(os.environ.get("EDGE_TREE_THRESHOLD", "0.55"))
 
 
 def _tree_verdict(x: float, r: float) -> float:
     """
-    Soft-vote XGBoost + RF: flag when the mean probability clears the
-    threshold AND neither tree strongly disagrees (min >= 0.3). Strict
-    "both > 0.5" missed floods where RF sat at ~0.58 while XGB said 0.99.
+    Consensus vote XGBoost + RF:
+      - Both agree above threshold AND RF confirms (>= 0.40) → flag
+      - One tree very high (>= 0.90) AND the other confirms (>= 0.40) → flag
+      - XGB alone, no matter how high, does NOT flag alone (too many false-
+        positives on sparse flows from the Pi's network sniffer)
     Returns the mean probability (the confidence) or 0.0 for benign.
     """
     mean = (x + r) / 2
-    return mean if (mean >= _TREE_PROB_THRESHOLD and min(x, r) >= 0.3) else 0.0
+    # Both models must agree — RF calibration is more reliable on live traffic
+    if mean >= _TREE_PROB_THRESHOLD and min(x, r) >= 0.40:
+        return mean
+    # Very high single-model confidence still needs the other to confirm
+    if (x >= 0.90 and r >= 0.40) or (r >= 0.90 and x >= 0.40):
+        return mean
+    return 0.0
 _AUTOENCODER_MSE_THRESHOLD = 50.0
 _BILSTM_PROB_THRESHOLD = 0.98
 
@@ -237,26 +250,94 @@ class MLEngine:
 
     def _prepare_features(self, flow_data: dict):
         """
-        Aligns flow_data dict to the 78-column CIC-IDS-2017 feature vector.
-        Missing columns are zero-padded.
+        Aligns flow_data dict to the trained CIC-IDS-2017 feature vector.
+        Missing columns use realistic network protocol defaults instead of raw zeros
+        to prevent false-positive anomaly skew on sparse flows.
 
         Returns:
-            scaled_vector: np.ndarray shape (1, 78)
+            scaled_vector: np.ndarray shape (1, N)
             raw_values:    list[float]  — unscaled, for XAI display
         """
         if self.feature_columns is None or self.scaler is None:
             raise ValueError("Feature columns / scaler not loaded.")
+
+        # ── Duration: normalise to seconds ────────────────────────────────
+        # network_scanner stores duration as microseconds (Flow Duration field);
+        # /api/ingest senders may pass seconds.  Heuristic: if value > 1000 it's
+        # almost certainly microseconds (a 1000-second flow is pathological).
+        dur = float(flow_data.get("flow_duration", flow_data.get("Flow Duration", 0.0)))
+        dur_s = max(dur / 1e6, 1e-6) if dur > 1000 else max(dur, 1e-6)
+
+        fwd_pkts = int(flow_data.get("total_fwd_packets", flow_data.get("Tot Fwd Pkts", 1)))
+        bwd_pkts = int(flow_data.get("total_bwd_packets", flow_data.get("Tot Bwd Pkts", 0)))
+        tot_pkts = max(fwd_pkts + bwd_pkts, 1)
+
+        byts_s = float(flow_data.get("flow_bytes_per_sec", flow_data.get("Flow Byts/s", 0.0)))
+        tot_byts = byts_s * dur_s
+
+        # Average packet size: clamp to [52, 1460] (min Ethernet frame payload
+        # through max TCP MSS).  Raw zero → use 64-byte minimum (ACK/SYN size).
+        avg_pkt = max(52.0, min((tot_byts / tot_pkts) if tot_pkts and tot_byts > 0 else 64.0, 1460.0))
+
+        # ── Computed defaults (only used for features absent from flow_data) ─
+        # Init Bwd Win Byts: -1 is the CIC-IDS-2017 sentinel for "no backward
+        # window observed" (e.g. no TCP handshake response from the peer).  The
+        # training-set mean for this feature is ~98 with std ~124, so any large
+        # positive value (e.g. Linux's 29200-byte default) scales to 200+ σ and
+        # completely dominates the prediction — do NOT use 29200 as a fallback.
+        computed_defaults = {
+            "Flow Duration":   dur,
+            "Tot Fwd Pkts":    fwd_pkts,
+            "Tot Bwd Pkts":    bwd_pkts,
+            "Flow Byts/s":     byts_s,
+            "Flow Pkts/s":     tot_pkts / dur_s,
+            "Fwd Pkts/s":      fwd_pkts / dur_s,
+            "Bwd Pkts/s":      bwd_pkts / dur_s,
+            "Pkt Size Avg":    avg_pkt,
+            "Fwd Header Len":  fwd_pkts * 20,
+            "Bwd Header Len":  bwd_pkts * 20,
+            # -1 = "not recorded" — matches training convention for missing windows
+            "Init Fwd Win Byts": -1,
+            "Init Bwd Win Byts": -1,
+            "Fwd Seg Size Min": 20,
+            "TotLen Fwd Pkts":  fwd_pkts * avg_pkt,
+            "TotLen Bwd Pkts":  bwd_pkts * avg_pkt,
+            "Fwd Pkt Len Mean": avg_pkt,
+            "Bwd Pkt Len Mean": avg_pkt if bwd_pkts else 0.0,
+            "Bwd Pkt Len Max":  avg_pkt if bwd_pkts else 0.0,
+            "Flow IAT Mean":    (dur_s * 1e6) / max(tot_pkts - 1, 1),
+            "Down/Up Ratio":    (bwd_pkts / fwd_pkts) if fwd_pkts else 0.0,
+            # Subflow mirrors the main flow for single-subflow sessions
+            "Subflow Fwd Pkts": fwd_pkts,
+            "Subflow Fwd Byts": int(fwd_pkts * avg_pkt),
+            "Subflow Bwd Pkts": bwd_pkts,
+            "Subflow Bwd Byts": int(bwd_pkts * avg_pkt),
+            # Bulk stats: 0 is correct — CIC-IDS-2017 bulk features are almost
+            # always 0 in benign traffic (mean=0, std=0 from scaler).
+            "Fwd Byts/b Avg":  0, "Fwd Pkts/b Avg":  0, "Fwd Blk Rate Avg": 0,
+            "Bwd Byts/b Avg":  0, "Bwd Pkts/b Avg":  0, "Bwd Blk Rate Avg": 0,
+            "CWE Flag Count":  0, "ECE Flag Cnt":     0,
+            # Active/Idle stats: 0 means the flow was a single uninterrupted
+            # session — correct default since training means for these are ~27µs
+            # and scaler std is ~5184µs → scaled(0) ≈ −0.005, negligible.
+            "Active Mean": 0, "Active Std": 0, "Active Max": 0, "Active Min": 0,
+            "Idle Mean":   0, "Idle Std":   0, "Idle Max":   0, "Idle Min":   0,
+        }
 
         raw_values = []
         for col in self.feature_columns:
             json_key = _KEY_MAP.get(col)
             if json_key and json_key in flow_data:
                 raw_values.append(float(flow_data[json_key]))
+            elif col in flow_data:
+                raw_values.append(float(flow_data[col]))
+            elif col in computed_defaults:
+                raw_values.append(float(computed_defaults[col]))
             else:
-                raw_values.append(float(flow_data.get(col, 0.0)))
+                raw_values.append(0.0)
 
-        fv = np.array([raw_values])           # (1, 78)
-        scaled = self.scaler.transform(fv)    # (1, 78)
+        fv = np.array([raw_values])
+        scaled = self.scaler.transform(fv)
         return scaled, raw_values
 
     # ── XAI ──────────────────────────────────────────────────────────────
