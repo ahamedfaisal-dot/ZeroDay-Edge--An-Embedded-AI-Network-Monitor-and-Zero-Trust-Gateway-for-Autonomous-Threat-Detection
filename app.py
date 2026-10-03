@@ -21,9 +21,28 @@ Background threads:
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
+
+# Auto-elevate with sudo on Linux if not root (required for Scapy raw sockets & iptables)
+if hasattr(os, "geteuid") and os.geteuid() != 0:
+    if os.environ.get("_CYBERSHIELD_ELEVATED") != "1":
+        env = os.environ.copy()
+        env["_CYBERSHIELD_ELEVATED"] = "1"
+        print("\n[!] ZeroDay-Edge packet capture requires root privileges.")
+        print("[*] Auto-elevating with sudo (password: pi)...\n")
+        try:
+            proc = subprocess.Popen(
+                ["sudo", "-S", "-E", sys.executable] + sys.argv,
+                stdin=subprocess.PIPE,
+                env=env,
+            )
+            proc.communicate(input=b"pi\n")
+            sys.exit(proc.returncode)
+        except Exception as _e:
+            print(f"[-] Auto-elevation failed: {_e}. Please run with: sudo bash start.sh")
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
