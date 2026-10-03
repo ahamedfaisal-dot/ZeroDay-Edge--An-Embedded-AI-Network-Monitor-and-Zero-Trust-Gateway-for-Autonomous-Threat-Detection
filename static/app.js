@@ -342,14 +342,25 @@ document.getElementById('btn-scan')?.addEventListener('click', async () => {
   if (btn) { btn.textContent = 'Scan'; btn.disabled = false; }
 });
 
-document.getElementById('btn-clear')?.addEventListener('click', async () => {
-  if (!confirm('Clear all alerts, flows, blocked IPs, and device registry? This cannot be undone.')) return;
-  const btn = document.getElementById('btn-clear');
-  if (btn) { btn.textContent = '…'; btn.disabled = true; }
-  await fetch(API.clear, { method: 'POST' });
-  await Promise.all([pollDashboard(), pollAlerts(), fetchBlocked(), fetchNetwork()]);
-  if (btn) { btn.textContent = 'Clear'; btn.disabled = false; }
-});
+async function handleClearAll() {
+  const btn1 = document.getElementById('btn-clear');
+  const btn2 = document.getElementById('btn-header-clear');
+  if (btn1) { btn1.textContent = 'Clearing…'; btn1.disabled = true; }
+  if (btn2) { btn2.textContent = 'Clearing…'; btn2.disabled = true; }
+
+  try {
+    await fetch(API.clear, { method: 'POST' });
+    await Promise.allSettled([pollDashboard(), pollAlerts(), fetchBlocked(), fetchNetwork()]);
+  } catch (err) {
+    console.error('Clear error:', err);
+  } finally {
+    if (btn1) { btn1.textContent = 'Clear Data'; btn1.disabled = false; }
+    if (btn2) { btn2.textContent = 'Clear Data'; btn2.disabled = false; }
+  }
+}
+
+document.getElementById('btn-clear')?.addEventListener('click', handleClearAll);
+document.getElementById('btn-header-clear')?.addEventListener('click', handleClearAll);
 
 /* ══════════════════════════════════════════════════════════════════════ */
 /* BLOCKED PAGE                                                            */
@@ -497,12 +508,12 @@ pollDashboard();
 pollAlerts();
 fetchBlocked();
 
-// Recurring polls
-setInterval(pollDashboard, 4000);   // stats + mini feed every 4 s
-setInterval(pollAlerts,    8000);   // alerts list every 8 s
-setInterval(fetchBlocked,  10000);  // blocked IPs every 10 s
+// Recurring polls (tuned for low-latency live monitoring)
+setInterval(pollDashboard, 1000);   // stats + mini feed every 1 s
+setInterval(pollAlerts,    1500);   // alerts list every 1.5 s
+setInterval(fetchBlocked,  2000);   // blocked IPs every 2 s
 
 // Network page auto-refresh when visible
 setInterval(() => {
   if (activePage === 'network') fetchNetwork();
-}, 30000);
+}, 8000);

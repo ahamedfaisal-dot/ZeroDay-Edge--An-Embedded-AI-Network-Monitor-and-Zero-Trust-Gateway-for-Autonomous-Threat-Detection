@@ -17,6 +17,7 @@ Two responsibilities:
 
 import logging
 import re
+import platform
 import shutil
 import socket
 import subprocess
@@ -27,6 +28,8 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+IS_WINDOWS = platform.system() == "Windows"
+
 # ── Scapy availability check ──────────────────────────────────────────────
 SCAPY_AVAILABLE = False
 try:
@@ -36,24 +39,134 @@ try:
 except ImportError:
     logger.warning("Scapy not installed — live capture disabled (manual ingest only)")
 
-# ── nmcli availability check (Evil Twin / Beacon Flood detection) ─────────
-# Uses a normal station-mode WiFi scan — no monitor mode needed, unlike
-# deauth detection.
-NMCLI_AVAILABLE = shutil.which("nmcli") is not None
-if NMCLI_AVAILABLE:
-    logger.info("nmcli available — WiFi SSID scan (Evil Twin/Beacon Flood) enabled")
+# ── WiFi SSID scan availability check (Evil Twin / Beacon Flood) ─────────
+# On Windows: uses native `netsh wlan show networks mode=bssid`
+# On Linux:   uses station-mode `nmcli`
+WIFI_SCAN_AVAILABLE = IS_WINDOWS or (shutil.which("nmcli") is not None)
+if WIFI_SCAN_AVAILABLE:
+    backend = "Windows netsh" if IS_WINDOWS else "Linux nmcli"
+    logger.info("WiFi SSID scan enabled (%s) — Evil Twin/Beacon Flood active", backend)
 else:
-    logger.warning("nmcli not found — Evil Twin/Beacon Flood detection disabled")
+    logger.warning("Neither netsh nor nmcli found — Evil Twin/Beacon Flood detection disabled")
 
 
 def _parse_nmcli_terse(line: str) -> list[str]:
     """
-    Split one line of `nmcli -t` output on unescaped colons — nmcli escapes
-    literal colons inside field values (e.g. a BSSID's own colons) with a
-    backslash specifically so they don't collide with the field separator.
+    Split one line of `nmcli -t` output on unescaped colons.
     """
     fields = re.split(r"(?<!\\):", line)
     return [f.replace("\\:", ":").replace("\\\\", "\\") for f in fields]
+
+
+def _trigger_windows_wlan_scan():
+    """Trigger an active hardware probe scan on Windows using WlanScan API."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        wlan = ctypes.windll.wlanapi
+        handle = wintypes.HANDLE()
+        neg_ver = wintypes.DWORD()
+        if wlan.WlanOpenHandle(2, None, ctypes.byref(neg_ver), ctypes.byref(handle)) == 0:
+            class WLAN_INTERFACE_INFO(ctypes.Structure):
+                _fields_ = [('InterfaceGuid', ctypes.c_ubyte * 16), ('strInterfaceDescription', ctypes.c_wchar * 256), ('isState', ctypes.c_uint)]
+            class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+                _fields_ = [('dwNumberOfItems', wintypes.DWORD), ('dwIndex', wintypes.DWORD), ('InterfaceInfo', WLAN_INTERFACE_INFO * 1)]
+            pList = ctypes.c_void_p()
+            if wlan.WlanEnumInterfaces(handle, None, ctypes.byref(pList)) == 0 and pList:
+                info_list = ctypes.cast(pList, ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)).contents
+                for i in range(info_list.dwNumberOfItems):
+                    wlan.WlanScan(handle, ctypes.byref(info_list.InterfaceInfo[i].InterfaceGuid), None, None, None)
+            wlan.WlanCloseHandle(handle, None)
+    except Exception:
+        pass
+
+
+def _get_connected_wifi() -> tuple[str | None, str | None]:
+    """Get currently connected SSID and AP BSSID on Windows."""
+    try:
+        res = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True, timeout=5)
+        ssid, bssid = None, None
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("SSID") and not line.startswith("BSSID"):
+                p = line.split(":", 1)
+                if len(p) == 2:
+                    ssid = p[1].strip()
+            elif "BSSID" in line:
+                m = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", line)
+                if m and not bssid:
+                    bssid = m.group(1).lower()
+        return ssid, bssid
+    except Exception:
+        return None, None
+
+
+def _scan_wifi_windows() -> list[dict]:
+    """Scan WiFi networks on Windows using active hardware probe + netsh."""
+    _trigger_windows_wlan_scan()
+    # Allow driver a brief moment to update WLAN cache with probe responses
+    time.sleep(1.2)
+    try:
+        res = subprocess.run(
+            ["netsh", "wlan", "show", "networks", "mode=bssid"],
+            capture_output=True, text=True, timeout=8
+        )
+        out = res.stdout
+    except Exception as e:
+        logger.debug("Windows WiFi netsh scan error: %s", e)
+        return []
+
+    networks = []
+    cur_ssid = None
+    cur_auth = ""
+    cur_enc = ""
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("SSID"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                cur_ssid = parts[1].strip()
+                cur_auth = ""
+                cur_enc = ""
+        elif line.startswith("Authentication"):
+            p = line.split(":", 1)
+            if len(p) == 2:
+                cur_auth = p[1].strip()
+        elif line.startswith("Encryption"):
+            p = line.split(":", 1)
+            if len(p) == 2:
+                cur_enc = p[1].strip()
+        elif line.startswith("BSSID") and cur_ssid:
+            m = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", line)
+            if m:
+                networks.append({
+                    "ssid": cur_ssid,
+                    "bssid": m.group(1).lower(),
+                    "auth": cur_auth,
+                    "encryption": cur_enc,
+                })
+    return networks
+
+
+def _scan_wifi_linux() -> list[tuple[str, str]]:
+    """Scan WiFi networks on Linux using nmcli."""
+    if not shutil.which("nmcli"):
+        return []
+    try:
+        out = subprocess.run(
+            ["nmcli", "-t", "-f", "SSID,BSSID", "dev", "wifi", "list", "--rescan", "yes"],
+            capture_output=True, text=True, timeout=12,
+        ).stdout
+    except Exception as e:
+        logger.warning("Linux WiFi nmcli scan failed: %s", e)
+        return []
+
+    networks = []
+    for line in out.splitlines():
+        fields = _parse_nmcli_terse(line)
+        if len(fields) == 2 and fields[0] and fields[1]:
+            networks.append((fields[0], fields[1].lower()))
+    return networks
 
 
 def _get_local_ip() -> str:
@@ -317,36 +430,34 @@ _MAX_FLOW_TABLE_ENTRIES = 4000
 # was verified against. Track volume/diversity per (src, dst) pair directly
 # instead of hoping the ML models happen to recognize that shattered
 # representation.
-# Key: (src_ip, dst_ip) — Value: {"ports": set(), "pkts": int, "bytes": int, "start": float}
-_scan_table: dict = defaultdict(lambda: {"ports": set(), "pkts": 0, "bytes": 0, "start": time.time()})
-_SCAN_PORT_THRESHOLD = 15     # distinct dst ports from one src to one dst within a window = scan
-_SCAN_MAX_AVG_PKTS_PER_PORT = 5  # below this density, high port count = scan, not flood
-_FLOOD_PACKET_THRESHOLD = 300  # packets from one src to one dst within a window = flood/DDoS
+# ── Port scan & burst tracker ──────────────────────────────────────────────
+# Common benign LAN infrastructure ports (DNS, DHCP, NTP, NetBIOS, SSDP, mDNS, LLMNR)
+# that normal OS networking queries every few seconds — excluded from port scan counts.
+_BENIGN_LAN_PORTS = {53, 67, 68, 123, 137, 138, 1900, 5351, 5353, 5355}
+
+# Key: (src_ip, dst_ip) — Value: {"ports": set(), "syn_ports": set(), "pkts": int, "bytes": int, "start": float, "last_alert": float}
+_scan_table: dict = defaultdict(lambda: {"ports": set(), "syn_ports": set(), "pkts": 0, "bytes": 0, "start": time.time(), "last_alert": 0.0})
+_SCAN_SYN_PORT_THRESHOLD = 6      # 6 or more distinct destination ports probed with SYN packets
+_SCAN_GENERIC_PORT_THRESHOLD = 8  # 8 or more distinct non-benign ports
+_FLOOD_PACKET_THRESHOLD = 400     # 400 packets burst
+_FLOOD_MIN_RATE = 40.0            # AND >= 40 packets per second (burst flood rate)
 
 # ── Brute-force tracker ────────────────────────────────────────────────────
-# Repeated login/connection attempts at ONE port look like the scan case —
-# many small separate flows (each attempt gets its own ephemeral source
-# port) — but concentrated on a single destination port instead of spread
-# across many. Counts fresh SYNs (SYN without ACK = a new connection
-# attempt, not a response) per (src, dst, dst_port).
-_bruteforce_table: dict = defaultdict(lambda: {"attempts": 0, "start": time.time()})
-_BRUTEFORCE_ATTEMPT_THRESHOLD = 10  # connection attempts to the same dst:port within a window
+# Key: (src_ip, dst_ip, dst_port) — Value: {"attempts": 0, "start": float, "last_alert": float}
+_bruteforce_table: dict = defaultdict(lambda: {"attempts": 0, "start": time.time(), "last_alert": 0.0})
+_BRUTEFORCE_ATTEMPT_THRESHOLD = 8  # 8 connection attempts to same auth port = brute force
 
 # ARP scan results cache
 _devices_cache: list[dict] = []
 _devices_lock  = threading.Lock()
 
 # ── WiFi SSID scan state (Evil Twin / Beacon Flood) ────────────────────────
-# First-seen-trusted, same philosophy as db.py's iot_devices Zero Trust
-# registry: the first BSSID seen for an SSID becomes the baseline; a second,
-# different BSSID for the same SSID is the classic Evil Twin signature.
 _known_ssid_bssids: dict = defaultdict(set)
 _wifi_scan_lock = threading.Lock()
 _last_evil_twin_alert: dict = {}
 _last_beacon_flood_alert: dict = {"t": 0.0}
-_BEACON_FLOOD_SSID_THRESHOLD = 25  # distinct SSIDs in one scan pass = flood
-_ALERT_COOLDOWN_SECONDS = 30       # don't re-alert the same condition more often than this
-
+_BEACON_FLOOD_SSID_THRESHOLD = 15  # 15 distinct SSIDs in one scan pass = flood
+_ALERT_COOLDOWN_SECONDS = 15       # alert cooldown
 
 class NetworkScanner:
     """
@@ -377,13 +488,37 @@ class NetworkScanner:
         self._sniff_running = True
         logger.info("Starting packet capture (interface=%s)…", self.interface or "auto")
 
+        # On Windows: also sniff the Npcap Loopback Adapter if present.
+        # This allows local tools like Nmap scanning 192.168.0.202 or localhost
+        # to be detected simultaneously with external network traffic on the WiFi/Ethernet adapter.
+        if IS_WINDOWS:
+            try:
+                from scapy.all import conf
+                for iface_name, iface_obj in conf.ifaces.items():
+                    desc = getattr(iface_obj, "description", "").lower()
+                    name = getattr(iface_obj, "name", "").lower()
+                    if "loopback" in desc or "loopback" in name:
+                        logger.info("Starting secondary loopback sniffer on: %s (%s)", name, iface_name)
+                        threading.Thread(
+                            target=self._sniff_worker,
+                            args=(iface_name,),
+                            daemon=True,
+                            name="scapy-loopback-sniff",
+                        ).start()
+                        break
+            except Exception as e:
+                logger.debug("Loopback sniff setup error: %s", e)
+
+        self._sniff_worker(self.interface)
+
+    def _sniff_worker(self, iface: str | None):
         kwargs: dict = {
             "prn":    self._handle_packet,
             "store":  False,
             "filter": "ip",          # only IPv4
         }
-        if self.interface:
-            kwargs["iface"] = self.interface
+        if iface:
+            kwargs["iface"] = iface
 
         try:
             sniff(**kwargs)  # blocks forever
@@ -393,7 +528,7 @@ class NetworkScanner:
                 "Run with: sudo python app.py"
             )
         except Exception as e:
-            logger.error("Capture error: %s", e)
+            logger.error("Capture error (%s): %s", iface or "auto", e)
 
     def _handle_packet(self, pkt):
         """Scapy callback — accumulate per-flow CIC-IDS-2017-style stats from each IP packet."""
@@ -403,12 +538,6 @@ class NetworkScanner:
 
             ip = pkt[IP]
             src, dst = ip.src, ip.dst
-
-            # Skip loopback and our own management traffic to Flask port
-            if src.startswith("127.") or dst.startswith("127."):
-                return
-            if src == LOCAL_IP and dst == LOCAL_IP:
-                return
 
             tcp_layer = pkt[TCP] if pkt.haslayer(TCP) else None
             udp_layer = pkt[UDP] if pkt.haslayer(UDP) else None
@@ -426,6 +555,23 @@ class NetworkScanner:
                 header_len = ip.ihl * 4
                 payload_len = len(ip.payload)
 
+            # Ignore management traffic to Flask dashboard (port 5000)
+            if sport == 5000 or dport == 5000:
+                return
+
+            # Ignore basic infrastructure services (DNS, DHCP, NTP, DoT) and LAN multicast/broadcast
+            # These are datagram/infrastructure utilities, not session flows, and produce false ML triggers.
+            if sport in (53, 67, 68, 123, 853) or dport in (53, 67, 68, 123, 853):
+                return
+            if dst.startswith("224.") or dst.startswith("239.") or dst == "255.255.255.255" or dst.endswith(".255"):
+                return
+            # Ignore internal localhost loopback IPC (Chrome, IDE, Windows local services)
+            if src.startswith("127.") and dst.startswith("127."):
+                return
+            # Public DNS resolvers (Cloudflare, Google, Quad9)
+            if dst in ("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9") or src in ("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9"):
+                return
+
             pkt_len = len(pkt)
             now = time.time()
 
@@ -438,12 +584,23 @@ class NetworkScanner:
                 _flow_table[key].add_packet(src, sport, dst, pkt_len, header_len, payload_len, tcp_layer, now)
 
                 scan_entry = _scan_table[(src, dst)]
-                scan_entry["ports"].add(dport)
+                if dport > 0:
+                    scan_entry["ports"].add(dport)
                 scan_entry["pkts"] += 1
                 scan_entry["bytes"] += pkt_len
 
-                if tcp_layer is not None and tcp_layer.flags.S and not tcp_layer.flags.A:
-                    _bruteforce_table[(src, dst, dport)]["attempts"] += 1
+                if tcp_layer is not None:
+                    # Fresh SYN connection attempt (e.g. brute-force / connect scan)
+                    if tcp_layer.flags.S and not tcp_layer.flags.A:
+                        scan_entry["syn_ports"].add(dport)
+                        # Only track brute-force attempts on known authentication/management services
+                        if dport in (21, 22, 23, 445, 1433, 3306, 3389, 5432):
+                            _bruteforce_table[(src, dst, dport)]["attempts"] += 1
+                    # Port scan flag anomalies (NULL scan, Xmas scan, SYN-FIN scan)
+                    flags = tcp_layer.flags
+                    if int(flags) == 0 or (flags.F and flags.P and flags.U) or (flags.S and flags.F):
+                        scan_entry["syn_ports"].add(dport)
+                        scan_entry["ports"].add(dport)
 
         except Exception:
             pass  # never crash the capture thread
@@ -463,95 +620,141 @@ class NetworkScanner:
 
     def drain_burst_alerts(self) -> list[dict]:
         """
-        Snapshot and clear the burst tracker. Returns pre-formed alert dicts
-        (same shape as MLEngine.classify()'s output) for any (src, dst) pair
-        that crossed the flood or scan threshold in the window — bypasses
-        the ML pipeline entirely, see _scan_table comment.
-
-        Scan vs flood is told apart by packets-PER-PORT, not raw packet
-        count: a scan spreads ~1 packet across each of many ports (low
-        density), a flood concentrates hundreds of packets on one or two
-        ports (high density). Raw packet count alone was wrong — a normal
-        1000-port nmap scan easily exceeds a "300 packets in 5s" flood
-        threshold on total volume, which mislabeled real scans as floods.
+        Evaluate the burst tracker. Returns pre-formed alert dicts
+        for any (src, dst) pair that crossed the flood or scan threshold.
+        Maintains rolling history so probes are never lost across drain cycles.
         """
         with _flow_lock:
-            snapshot = dict(_scan_table)
-            _scan_table.clear()
+            snapshot = list(_scan_table.items())
 
         now = time.time()
         alerts = []
-        for (src, dst), data in snapshot.items():
-            n_ports = len(data["ports"])
-            n_pkts = data["pkts"]
-            window_s = round(now - data["start"], 1)
-            avg_pkts_per_port = n_pkts / max(n_ports, 1)
+        to_delete = []
 
-            if n_ports >= _SCAN_PORT_THRESHOLD and avg_pkts_per_port < _SCAN_MAX_AVG_PKTS_PER_PORT:
-                confidence = min(n_ports / (_SCAN_PORT_THRESHOLD * 4), 1.0)
-                alerts.append({
-                    "source_ip": src,
-                    "dest_ip": dst,
-                    "threat_class": "PortScan",
-                    "confidence": confidence,
-                    "detected_by": "Port Scan Heuristic",
-                    "is_blocked": confidence >= 0.85,
-                    "xai_features": [
-                        {"name": "distinct_ports_scanned", "raw_value": n_ports, "impact": 1.0},
-                        {"name": "packets_in_window", "raw_value": n_pkts, "impact": 0.6},
-                        {"name": "window_seconds", "raw_value": window_s, "impact": 0.0},
-                    ],
-                    "timestamp": datetime.utcnow().isoformat(),
-                })
-            elif n_pkts >= _FLOOD_PACKET_THRESHOLD:
-                confidence = min(n_pkts / (_FLOOD_PACKET_THRESHOLD * 4), 1.0)
-                alerts.append({
-                    "source_ip": src,
-                    "dest_ip": dst,
-                    "threat_class": "DDoS / Flood",
-                    "confidence": confidence,
-                    "detected_by": "Flood Heuristic",
-                    "is_blocked": confidence >= 0.85,
-                    "xai_features": [
-                        {"name": "packets_in_window", "raw_value": n_pkts, "impact": 1.0},
-                        {"name": "bytes_in_window", "raw_value": data["bytes"], "impact": 0.7},
-                        {"name": "window_seconds", "raw_value": window_s, "impact": 0.0},
-                    ],
-                    "timestamp": datetime.utcnow().isoformat(),
-                })
+        for (src, dst), data in snapshot:
+            n_pkts = data["pkts"]
+            window_s = max(round(now - data["start"], 1), 0.1)
+
+            # Filter out benign LAN infrastructure ports (DNS, DHCP, SSDP, mDNS, etc.)
+            non_infra_ports = data["ports"] - _BENIGN_LAN_PORTS
+            syn_ports = data["syn_ports"] - _BENIGN_LAN_PORTS
+
+            # Guard router gateway from normal OS service queries
+            is_gateway = (dst == "192.168.0.1" or dst.endswith(".1"))
+            syn_thresh = 8 if is_gateway else _SCAN_SYN_PORT_THRESHOLD
+
+            # Evict stale entries with no activity for 30s
+            if now - data["start"] > 30 and len(syn_ports) < syn_thresh and n_pkts < _FLOOD_PACKET_THRESHOLD:
+                to_delete.append((src, dst))
+                continue
+
+            # 1. Port scan detection (requires distinct destination ports probed with SYN packets)
+            is_port_scan = (len(syn_ports) >= syn_thresh)
+            if is_port_scan:
+                if now - data.get("last_alert", 0.0) >= 3.0:
+                    port_count = len(syn_ports)
+                    confidence = min(0.85 + (port_count / 20.0) * 0.14, 0.99)
+                    alerts.append({
+                        "source_ip": src,
+                        "dest_ip": dst,
+                        "threat_class": "PortScan",
+                        "confidence": round(confidence, 2),
+                        "detected_by": "Port Scan Heuristic",
+                        "is_blocked": confidence >= 0.85,
+                        "xai_features": [
+                            {"name": "distinct_ports_scanned", "raw_value": port_count, "impact": 1.0},
+                            {"name": "syn_probes", "raw_value": port_count, "impact": 0.8},
+                            {"name": "window_seconds", "raw_value": window_s, "impact": 0.0},
+                        ],
+                        "timestamp": datetime.utcnow().isoformat(),
+                    })
+                    data["last_alert"] = now
+                    data["ports"] = set()
+                    data["syn_ports"] = set()
+                    data["pkts"] = 0
+                    data["bytes"] = 0
+                    data["start"] = now
+
+            # 2. Flood / DDoS detection
+            # True flood attacks consist of rapid small packets (< 300 bytes, e.g. SYN flood, UDP flood)
+            # at high packet rates, rather than normal bulk MTU data downloads (> 1000 bytes/pkt).
+            avg_pkt_sz = data["bytes"] / max(n_pkts, 1)
+            is_flood = (
+                n_pkts >= 800 and
+                (n_pkts / window_s) >= 80.0 and
+                avg_pkt_sz < 300 and
+                src != LOCAL_IP
+            )
+            if is_flood:
+                if now - data.get("last_alert", 0.0) >= 3.0:
+                    confidence = min(0.80 + (n_pkts / 2000.0) * 0.19, 0.99)
+                    alerts.append({
+                        "source_ip": src,
+                        "dest_ip": dst,
+                        "threat_class": "DDoS / Flood",
+                        "confidence": round(confidence, 2),
+                        "detected_by": "Flood Heuristic",
+                        "is_blocked": confidence >= 0.85,
+                        "xai_features": [
+                            {"name": "packets_in_window", "raw_value": n_pkts, "impact": 1.0},
+                            {"name": "packets_per_second", "raw_value": round(n_pkts / window_s, 1), "impact": 0.8},
+                            {"name": "avg_packet_bytes", "raw_value": round(avg_pkt_sz, 1), "impact": 0.5},
+                        ],
+                        "timestamp": datetime.utcnow().isoformat(),
+                    })
+                    data["last_alert"] = now
+                    data["pkts"] = 0
+                    data["bytes"] = 0
+                    data["start"] = now
+
+        with _flow_lock:
+            for k in to_delete:
+                _scan_table.pop(k, None)
+
         return alerts
 
     def drain_bruteforce_alerts(self) -> list[dict]:
         """
-        Snapshot and clear the brute-force tracker. Returns pre-formed alert
-        dicts for any (src, dst, dst_port) that crossed
-        _BRUTEFORCE_ATTEMPT_THRESHOLD fresh connection attempts in the window.
+        Evaluate the brute-force tracker for repeated connection attempts to the same port.
         """
         with _flow_lock:
-            snapshot = dict(_bruteforce_table)
-            _bruteforce_table.clear()
+            snapshot = list(_bruteforce_table.items())
 
         now = time.time()
         alerts = []
-        for (src, dst, port), data in snapshot.items():
+        to_delete = []
+
+        for (src, dst, port), data in snapshot:
             attempts = data["attempts"]
-            if attempts < _BRUTEFORCE_ATTEMPT_THRESHOLD:
+            if now - data["start"] > 30 and attempts < _BRUTEFORCE_ATTEMPT_THRESHOLD:
+                to_delete.append((src, dst, port))
                 continue
-            confidence = min(attempts / (_BRUTEFORCE_ATTEMPT_THRESHOLD * 4), 1.0)
-            alerts.append({
-                "source_ip": src,
-                "dest_ip": dst,
-                "threat_class": "Brute Force Attempt",
-                "confidence": confidence,
-                "detected_by": "Brute Force Heuristic",
-                "is_blocked": confidence >= 0.85,
-                "xai_features": [
-                    {"name": "connection_attempts", "raw_value": attempts, "impact": 1.0},
-                    {"name": "target_port", "raw_value": port, "impact": 0.3},
-                    {"name": "window_seconds", "raw_value": round(now - data["start"], 1), "impact": 0.0},
-                ],
-                "timestamp": datetime.utcnow().isoformat(),
-            })
+
+            if attempts >= _BRUTEFORCE_ATTEMPT_THRESHOLD:
+                if now - data.get("last_alert", 0.0) >= 3.0:
+                    confidence = min(0.75 + (attempts / 20.0) * 0.25, 0.99)
+                    alerts.append({
+                        "source_ip": src,
+                        "dest_ip": dst,
+                        "threat_class": "Brute Force Attempt",
+                        "confidence": round(confidence, 2),
+                        "detected_by": "Brute Force Heuristic",
+                        "is_blocked": confidence >= 0.85,
+                        "xai_features": [
+                            {"name": "connection_attempts", "raw_value": attempts, "impact": 1.0},
+                            {"name": "target_port", "raw_value": port, "impact": 0.8},
+                            {"name": "window_seconds", "raw_value": round(now - data["start"], 1), "impact": 0.0},
+                        ],
+                        "timestamp": datetime.utcnow().isoformat(),
+                    })
+                    data["last_alert"] = now
+                    data["attempts"] = 0
+                    data["start"] = now
+
+        with _flow_lock:
+            for k in to_delete:
+                _bruteforce_table.pop(k, None)
+
         return alerts
 
     # ── ARP Scan ──────────────────────────────────────────────────────────
@@ -635,7 +838,28 @@ class NetworkScanner:
                         "last_seen":     datetime.utcnow().isoformat(),
                     })
         except FileNotFoundError:
-            logger.warning("/proc/net/arp not found — not on Linux?")
+            import platform
+            if platform.system() == "Windows":
+                try:
+                    res = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=5)
+                    for line in res.stdout.splitlines():
+                        match = re.search(r"^\s*([\d\.]+)\s+([0-9a-fA-F\-]{17})\s+(\w+)", line)
+                        if match:
+                            ip = match.group(1)
+                            mac = match.group(2).replace("-", ":").lower()
+                            # skip broadcast and multicast
+                            if not ip.startswith("224.") and not ip.startswith("239.") and not ip.endswith(".255"):
+                                devices.append({
+                                    "ip":            ip,
+                                    "mac":           mac,
+                                    "hostname":      self._resolve(ip),
+                                    "is_suspicious": self._is_suspicious(ip),
+                                    "last_seen":     datetime.utcnow().isoformat(),
+                                })
+                except Exception as e:
+                    logger.warning("Windows arp -a fallback error: %s", e)
+            else:
+                logger.warning("/proc/net/arp not found — not on Linux?")
         except Exception as e:
             logger.warning("ARP table read error: %s", e)
         return devices
@@ -649,58 +873,96 @@ class NetworkScanner:
 
     def wifi_ssid_scan(self):
         """
-        Scan visible WiFi networks (normal station-mode scan via nmcli, no
-        monitor mode) and flag:
-          - Evil Twin: a known SSID suddenly broadcast from a second,
+        Scan visible WiFi networks (Windows netsh or Linux nmcli) and flag:
+          - Evil Twin / Rogue AP: a known SSID suddenly broadcast from a second,
             different BSSID.
           - Beacon Flood: an abnormal number of distinct SSIDs visible in
             one scan pass.
         """
-        if not NMCLI_AVAILABLE:
+        if not WIFI_SCAN_AVAILABLE:
             return
 
-        try:
-            out = subprocess.run(
-                ["nmcli", "-t", "-f", "SSID,BSSID", "dev", "wifi", "list", "--rescan", "yes"],
-                capture_output=True, text=True, timeout=15,
-            ).stdout
-        except Exception as e:
-            logger.warning("WiFi SSID scan failed: %s", e)
+        networks = _scan_wifi_windows() if IS_WINDOWS else _scan_wifi_linux()
+        if not networks:
             return
 
         now = time.time()
         seen_ssids: set = set()
+        connected_ssid, connected_bssid = _get_connected_wifi() if IS_WINDOWS else (None, None)
 
-        for line in out.splitlines():
-            fields = _parse_nmcli_terse(line)
-            if len(fields) != 2:
-                continue
-            ssid, bssid = fields
+        for net in networks:
+            if isinstance(net, dict):
+                ssid = net.get("ssid")
+                bssid = net.get("bssid")
+                auth = net.get("auth", "")
+                enc = net.get("encryption", "")
+            else:
+                ssid, bssid = net
+                auth, enc = "", ""
+
             if not ssid or not bssid:
                 continue
             seen_ssids.add(ssid)
 
+            # 1. Evil Twin impersonating the currently connected Wi-Fi network
+            if connected_ssid and connected_bssid:
+                is_exact = (ssid.lower() == connected_ssid.lower())
+                s_clean = re.sub(r"[^a-zA-Z0-9]", "", ssid.lower())
+                c_clean = re.sub(r"[^a-zA-Z0-9]", "", connected_ssid.lower())
+                is_clone = False
+                if not is_exact and len(s_clean) >= 4 and len(c_clean) >= 4:
+                    if s_clean in c_clean or c_clean in s_clean:
+                        is_clone = True
+
+                if (is_exact and bssid.lower() != connected_bssid.lower()) or is_clone:
+                    self._alert_evil_twin(
+                        ssid=ssid,
+                        bssid=bssid,
+                        reason=f"Impersonating legitimate network '{connected_ssid}' (Legitimate BSSID: {connected_bssid})",
+                        confidence=0.98,
+                        now=now,
+                    )
+                    continue
+
+            # 2. Multi-BSSID Evil Twin (same SSID broadcast from multiple MAC addresses)
             with _wifi_scan_lock:
                 known = _known_ssid_bssids[ssid]
-                is_new_bssid = bssid not in known
                 known.add(bssid)
                 has_other_bssid = len(known) > 1
 
-            if is_new_bssid and has_other_bssid:
-                self._alert_evil_twin(ssid, bssid, now)
+            if has_other_bssid:
+                self._alert_evil_twin(
+                    ssid=ssid,
+                    bssid=bssid,
+                    reason=f"SSID '{ssid}' broadcast from multiple BSSIDs ({len(known)} distinct MACs)",
+                    confidence=0.95,
+                    now=now,
+                )
+                continue
+
+            # 3. Rogue Open AP / Honeypot detection (e.g. Free Wifi, unencrypted rogue hotspot)
+            is_open = (auth.lower() in ("open", "none") or enc.lower() in ("none", "open"))
+            is_suspicious_name = any(w in ssid.lower() for w in ("free", "rogue", "evil", "fake", "honeypot", "public", "hack", "pine", "flipper"))
+            if is_open or is_suspicious_name:
+                self._alert_rogue_ap(
+                    ssid=ssid,
+                    bssid=bssid,
+                    auth=auth,
+                    enc=enc,
+                    now=now,
+                )
 
         if len(seen_ssids) >= _BEACON_FLOOD_SSID_THRESHOLD:
             self._alert_beacon_flood(len(seen_ssids), now)
 
     @staticmethod
-    def _alert_evil_twin(ssid: str, bssid: str, now: float):
+    def _alert_evil_twin(ssid: str, bssid: str, reason: str, confidence: float, now: float):
         key = (ssid, bssid)
         with _wifi_scan_lock:
             last = _last_evil_twin_alert.get(key, 0.0)
             if now - last < _ALERT_COOLDOWN_SECONDS:
                 return
             _last_evil_twin_alert[key] = now
-            known_count = len(_known_ssid_bssids.get(ssid, ()))
 
         try:
             from db import insert_alert
@@ -708,19 +970,48 @@ class NetworkScanner:
                 "source_ip": bssid,
                 "dest_ip": ssid,
                 "threat_class": "Evil Twin / Rogue AP",
-                "confidence": 0.9,
+                "confidence": confidence,
                 "detected_by": "WiFi Scan Heuristic",
                 "is_blocked": False,  # can't iptables-block a rogue AP's radio
                 "xai_features": [
                     {"name": "ssid", "raw_value": ssid, "impact": 1.0},
-                    {"name": "new_bssid", "raw_value": bssid, "impact": 1.0},
-                    {"name": "known_bssid_count", "raw_value": known_count, "impact": 0.5},
+                    {"name": "rogue_bssid", "raw_value": bssid, "impact": 1.0},
+                    {"name": "detection_reason", "raw_value": reason, "impact": 0.8},
                 ],
                 "timestamp": datetime.utcnow().isoformat(),
             })
-            logger.warning("Evil Twin suspected: SSID '%s' now also seen from %s", ssid, bssid)
+            logger.warning("Evil Twin detected! SSID '%s' (BSSID %s): %s", ssid, bssid, reason)
         except Exception as e:
             logger.debug("insert_alert (evil twin) error: %s", e)
+
+    @staticmethod
+    def _alert_rogue_ap(ssid: str, bssid: str, auth: str, enc: str, now: float):
+        key = (ssid, bssid, "rogue_ap")
+        with _wifi_scan_lock:
+            last = _last_evil_twin_alert.get(key, 0.0)
+            if now - last < _ALERT_COOLDOWN_SECONDS:
+                return
+            _last_evil_twin_alert[key] = now
+
+        try:
+            from db import insert_alert
+            insert_alert({
+                "source_ip": bssid,
+                "dest_ip": ssid,
+                "threat_class": "Evil Twin / Rogue AP",
+                "confidence": 0.95,
+                "detected_by": "WiFi Scan Heuristic",
+                "is_blocked": False,
+                "xai_features": [
+                    {"name": "ssid", "raw_value": ssid, "impact": 1.0},
+                    {"name": "rogue_bssid", "raw_value": bssid, "impact": 1.0},
+                    {"name": "security", "raw_value": f"{auth or 'Open'}/{enc or 'None'}", "impact": 0.9},
+                ],
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            logger.warning("Rogue AP detected! SSID '%s' (BSSID %s) security: %s/%s", ssid, bssid, auth, enc)
+        except Exception as e:
+            logger.debug("insert_alert (rogue ap) error: %s", e)
 
     @staticmethod
     def _alert_beacon_flood(ssid_count: int, now: float):
@@ -749,33 +1040,29 @@ class NetworkScanner:
         except Exception as e:
             logger.debug("insert_alert (beacon flood) error: %s", e)
 
-    def start_periodic_scan(self, interval: int = 60):
-        """Launch a daemon thread that refreshes ARP + WiFi SSID scan data every `interval` seconds."""
-        def _loop():
-            # Run initial scans immediately
-            try:
-                self.arp_scan()
-            except Exception as e:
-                logger.error("Initial ARP scan failed: %s", e)
-            try:
-                self.wifi_ssid_scan()
-            except Exception as e:
-                logger.error("Initial WiFi SSID scan failed: %s", e)
-
+    def start_periodic_scan(self, interval: int = 30):
+        """Launch daemon threads that refresh ARP and WiFi SSID scan data."""
+        def _arp_loop():
             while True:
-                time.sleep(interval)
                 try:
                     self.arp_scan()
                 except Exception as e:
                     logger.error("Periodic ARP scan failed: %s", e)
+                time.sleep(interval)
+
+        def _wifi_loop():
+            while True:
                 try:
                     self.wifi_ssid_scan()
                 except Exception as e:
-                    logger.error("Periodic WiFi SSID scan failed: %s", e)
+                    logger.debug("Periodic WiFi scan failed: %s", e)
+                time.sleep(6)  # Rapid 6s polling for Rogue AP / Evil Twin detection
 
-        t = threading.Thread(target=_loop, daemon=True, name="arp-scanner")
-        t.start()
-        logger.info("Periodic ARP + WiFi SSID scan started (interval=%ds)", interval)
+        t_arp = threading.Thread(target=_arp_loop, daemon=True, name="arp-scanner")
+        t_arp.start()
+        t_wifi = threading.Thread(target=_wifi_loop, daemon=True, name="wifi-scanner")
+        t_wifi.start()
+        logger.info("Periodic ARP scan (interval=%ds) & Rogue AP scan (interval=6s) started", interval)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 

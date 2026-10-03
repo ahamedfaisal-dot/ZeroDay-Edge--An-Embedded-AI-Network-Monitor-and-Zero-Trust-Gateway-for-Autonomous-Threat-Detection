@@ -58,11 +58,25 @@ threading.Thread(target=ml.load, daemon=True, name="ml-loader").start()
 
 def _iptables(action: str, ip: str) -> bool:
     """
-    Add or remove an iptables INPUT DROP rule for `ip`.
-
+    Add or remove a firewall DROP/block rule for `ip`.
+    Uses netsh on Windows, iptables on Linux.
     action: '-A' (append) | '-D' (delete)
     Returns True on success, False on failure.
     """
+    import platform
+    if platform.system() == "Windows":
+        rule_name = f"ZeroDay_Block_{ip.replace(':', '_')}"
+        try:
+            if action == "-A":
+                cmd = ["netsh", "advfirewall", "firewall", "add", "rule", f"name={rule_name}", "dir=in", "action=block", f"remoteip={ip}"]
+            else:
+                cmd = ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"]
+            res = subprocess.run(cmd, capture_output=True, timeout=5)
+            return res.returncode == 0
+        except Exception as e:
+            logger.debug("Windows firewall error (%s): %s", ip, e)
+            return False
+
     try:
         subprocess.run(
             ["sudo", "iptables", action, "INPUT", "-s", ip, "-j", "DROP"],
@@ -83,6 +97,14 @@ def _iptables(action: str, ip: str) -> bool:
 
 
 def _block_ip(ip: str, reason: str = "auto", auto: bool = True):
+    from network_scanner import LOCAL_IP
+    if ip == LOCAL_IP or ip in ("127.0.0.1", "0.0.0.0", "localhost"):
+        logger.warning("Refusing to block local host IP %s (%s)", ip, reason)
+        return
+    # Never block default router gateway
+    if ip == "192.168.0.1" or ip.endswith(".1"):
+        logger.warning("Refusing to block router/gateway IP %s (%s)", ip, reason)
+        return
     _iptables("-A", ip)
     db.add_blocked_ip(ip, reason=reason, auto=auto)
     logger.info("Blocked %s (%s)", ip, reason)
@@ -110,16 +132,17 @@ def _classify_and_store(flow_data: dict) -> dict:
         if result.get("is_blocked") and not db.is_ip_blocked(result["source_ip"]):
             _block_ip(result["source_ip"], reason="auto", auto=True)
 
-        # Zero Trust: degrade this device's trust score
-        new_score = db.penalise_device(
-            ip=result["source_ip"],
-            confidence=float(result.get("confidence", 0.5)),
-        )
-        # If score just hit 0 the device is now auto-blocked in DB;
-        # also enforce the iptables rule if not already present
-        if new_score is not None and new_score <= 0:
-            if not db.is_ip_blocked(result["source_ip"]):
-                _block_ip(result["source_ip"], reason="zero-trust-score", auto=True)
+        # Zero Trust: degrade this device's trust score (never penalise local host or gateway router)
+        from network_scanner import LOCAL_IP
+        src = result["source_ip"]
+        if src != LOCAL_IP and src not in ("127.0.0.1", "0.0.0.0", "localhost", "192.168.0.1") and not src.endswith(".1"):
+            new_score = db.penalise_device(
+                ip=src,
+                confidence=float(result.get("confidence", 0.5)),
+            )
+            if new_score is not None and new_score <= 0:
+                if not db.is_ip_blocked(src):
+                    _block_ip(src, reason="zero-trust-score", auto=True)
 
     return result
 
@@ -129,8 +152,8 @@ def _classify_and_store(flow_data: dict) -> dict:
 # Tunable via env — on a 4GB Pi 4, widening these spacings trades detection
 # latency for lower average CPU/IO load, since the same core budget is now
 # also shared with Chromium kiosk if it's running on-device.
-_FLOW_DRAIN_INTERVAL = int(os.environ.get("EDGE_FLOW_INTERVAL", "5"))
-_ARP_SCAN_INTERVAL   = int(os.environ.get("EDGE_ARP_INTERVAL", "60"))
+_FLOW_DRAIN_INTERVAL = int(os.environ.get("EDGE_FLOW_INTERVAL", "1"))
+_ARP_SCAN_INTERVAL   = int(os.environ.get("EDGE_ARP_INTERVAL", "30"))
 _DB_PRUNE_INTERVAL   = int(os.environ.get("EDGE_DB_PRUNE_INTERVAL", "1800"))  # 30 min
 
 
@@ -151,6 +174,10 @@ def _flow_drain_loop():
                 db.insert_alert(result)
                 if result.get("is_blocked") and not db.is_ip_blocked(result["source_ip"]):
                     _block_ip(result["source_ip"], reason="heuristic:" + result["detected_by"], auto=True)
+                from network_scanner import LOCAL_IP
+                src = result["source_ip"]
+                if src != LOCAL_IP and src not in ("127.0.0.1", "0.0.0.0", "localhost", "192.168.0.1") and not src.endswith(".1"):
+                    db.penalise_device(src, confidence=float(result.get("confidence", 0.8)))
         except Exception as e:
             logger.error("Flow drain error: %s", e)
 

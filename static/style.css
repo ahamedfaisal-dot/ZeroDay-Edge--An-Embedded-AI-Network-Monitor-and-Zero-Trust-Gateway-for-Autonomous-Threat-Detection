@@ -82,6 +82,24 @@ html, body {
   overflow: hidden;
   position: relative;
   border: 1px solid var(--border);  /* visible when running on laptop */
+  transform-origin: center center;
+  transition: transform 0.2s ease;
+}
+
+@media (min-width: 800px) and (min-height: 550px) {
+  .app {
+    transform: scale(1.5);
+    border-radius: 10px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7), 0 0 0 1px var(--border);
+  }
+}
+
+@media (min-width: 1200px) and (min-height: 750px) {
+  .app {
+    transform: scale(1.85);
+    border-radius: 12px;
+    box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8), 0 0 0 1px var(--border);
+  }
 }
 
 /* ── Header ───────────────────────────────────────────────────────────── */
@@ -281,8 +299,34 @@ html, body {
 .btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 .btn-sm:active { background: rgba(59,130,246,0.08); }
 
-.btn-danger:hover { border-color: var(--danger); color: var(--danger); }
-.btn-danger:active { background: rgba(239,68,68,0.08); }
+.btn-danger {
+  color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+.btn-danger:hover {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: var(--danger);
+  color: #fff;
+}
+.btn-danger:active { background: rgba(239,68,68,0.25); }
+
+.btn-header-clear {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: var(--radius-sm);
+  color: #fca5a5;
+  font-family: var(--font);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 3px 8px;
+  margin-left: 6px;
+  transition: all 0.15s;
+}
+.btn-header-clear:hover {
+  background: var(--danger);
+  color: #fff;
+}
 
 .btn-unblock {
   background: none;

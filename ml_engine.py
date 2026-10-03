@@ -346,6 +346,14 @@ class MLEngine:
             logger.warning("Models not loaded — returning Benign default.")
             return result
 
+        # Guard: CIC-IDS-2017 models were trained on mature bidirectional network flows.
+        # Single-packet fragments or micro-flows have almost all 78 features zero/uninitialized,
+        # which causes tree models to falsely classify them as malicious DoS/probes.
+        tot_fwd = int(flow_data.get("Tot Fwd Pkts", flow_data.get("total_fwd_packets", 0)))
+        tot_bwd = int(flow_data.get("Tot Bwd Pkts", flow_data.get("total_bwd_packets", 0)))
+        if (tot_fwd + tot_bwd) < 4 or tot_fwd < 2:
+            return result
+
         try:
             scaled_fv, raw_values = self._prepare_features(flow_data)
         except Exception as e:
@@ -357,12 +365,13 @@ class MLEngine:
         # ── Stage 1: Tree Ensemble ──────────────────────────────────────
         if self.xgb is not None and self.rf is not None:
             try:
-                xgb_pred = int(self.xgb.predict(scaled_fv)[0])
-                rf_pred  = int(self.rf.predict(scaled_fv)[0])
-                if xgb_pred == 1 and rf_pred == 1:
+                # Require genuine model consensus with high confidence to prevent false alarms
+                xgb_prob = float(self.xgb.predict_proba(scaled_fv)[0][1])
+                rf_prob  = float(self.rf.predict_proba(scaled_fv)[0][1])
+                if xgb_prob >= 0.85 and rf_prob >= 0.55:
                     result["threat_class"] = "Malicious"
                     result["detected_by"]  = "Tree Ensemble"
-                    result["confidence"]   = 0.99
+                    result["confidence"]   = round((xgb_prob + rf_prob) / 2.0, 2)
             except Exception as e:
                 logger.error("Stage 1 (Tree Ensemble) failed: %s", e)
 

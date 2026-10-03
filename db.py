@@ -455,3 +455,15 @@ def penalise_device(ip: str, confidence: float) -> float | None:
         ip, row["trust_score"], new_score, new_status,
     )
     return new_score
+
+
+def clear_all_data():
+    """Clear all alerts, flows, blocked IPs, and reset IoT devices to 100% clean state."""
+    conn = _get_conn()
+    conn.execute("DELETE FROM threat_alerts")
+    conn.execute("DELETE FROM blocked_ips")
+    conn.execute("DELETE FROM network_flows")
+    conn.execute("UPDATE iot_devices SET trust_score = 100.0, status = 'unverified', alert_count = 0")
+    conn.commit()
+    conn.close()
+    logger.info("Database: all alerts, flows, and blocks wiped, devices reset to 100% trust")
