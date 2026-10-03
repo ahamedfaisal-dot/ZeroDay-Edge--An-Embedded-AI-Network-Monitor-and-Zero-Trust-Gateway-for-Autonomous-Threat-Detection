@@ -500,4 +500,17 @@ if __name__ == "__main__":
     logger.info(" Zero Trust Gateway | Autonomous Threat Detection")
     logger.info(" http://0.0.0.0:5000")
     logger.info("=" * 60)
+
+    # Open the dashboard in Chromium kiosk mode on the Pi's own screen (it waits
+    # for this server to come up first). EDGE_KIOSK=0 turns it off.
+    if os.name == "posix" and os.environ.get("EDGE_KIOSK", "1") != "0":
+        _kiosk = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kiosk_launch.sh")
+        if os.path.exists(_kiosk):
+            try:
+                # inherit stdout/stderr so "[kiosk] ..." reasons show in this terminal
+                subprocess.Popen(["bash", _kiosk], start_new_session=True, stdin=subprocess.DEVNULL)
+                logger.info("Kiosk: launching Chromium on the Pi display (log: /tmp/zeroday-kiosk.log)")
+            except Exception as e:
+                logger.warning("Kiosk launch failed: %s", e)
+
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

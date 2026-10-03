@@ -36,6 +36,12 @@ BACKEND = "iptables" if IPTABLES else ("nft" if NFT else "none")
 _MGMT_PORTS = (os.environ.get("EDGE_PORT", "5000"), "22")
 _TABLE = ("inet", "cybershield")
 
+# EDGE_STRICT_BLOCK=1: a blocked IP is dropped on EVERY port, including the
+# dashboard (5000) and SSH (22). Default 0: those two ports stay reachable from
+# any address so an operator testing from their own PC can't lock themselves
+# out. (With strict on, unblock from the Pi's own screen/kiosk or a whitelisted IP.)
+STRICT = os.environ.get("EDGE_STRICT_BLOCK", "0") == "1"
+
 
 def _is_root() -> bool:
     return hasattr(os, "geteuid") and os.geteuid() == 0
@@ -70,7 +76,8 @@ def _ipt_setup():
 def _ipt_block(ip: str) -> bool:
     if _ipt("-C", "INPUT", "-s", ip, "-j", "DROP").returncode == 0:
         return True  # already enforced — don't stack duplicates
-    r = _ipt("-A", "INPUT", "-s", ip, "-j", "DROP")
+    # strict: insert at the top so it sits ahead of the management-port ACCEPTs
+    r = _ipt("-I", "INPUT", "1", "-s", ip, "-j", "DROP") if STRICT else _ipt("-A", "INPUT", "-s", ip, "-j", "DROP")
     if r.returncode != 0:
         logger.warning("firewall: iptables -A %s failed: %s", ip, r.stderr.strip())
     return r.returncode == 0
@@ -96,13 +103,15 @@ def _nft(script: str) -> subprocess.CompletedProcess:
 def _nft_setup():
     ports = ", ".join(str(p) for p in _MGMT_PORTS)
     t = " ".join(_TABLE)
+    drop_rule = f"add rule {t} input ip saddr @blocked drop"
     script = f"""
 add table {t}
 add set {t} blocked {{ type ipv4_addr; }}
 add chain {t} input {{ type filter hook input priority -10; policy accept; }}
 flush chain {t} input
+{drop_rule if STRICT else ""}
 add rule {t} input tcp dport {{ {ports} }} accept
-add rule {t} input ip saddr @blocked drop
+{"" if STRICT else drop_rule}
 """
     r = _nft(script)
     if r.returncode == 0:
@@ -139,7 +148,7 @@ def setup():
             "Install one: sudo apt install -y nftables  (or iptables)"
         )
         return
-    logger.info("firewall: backend=%s", BACKEND)
+    logger.info("firewall: backend=%s strict_block=%s", BACKEND, STRICT)
     try:
         (_ipt_setup if BACKEND == "iptables" else _nft_setup)()
     except Exception as e:

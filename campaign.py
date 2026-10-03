@@ -147,10 +147,13 @@ class CampaignEngine:
 
     def _summarise(self, c: _Campaign, now: float) -> dict:
         evs = list(c.events)
-        stages_seen = []
+        # Each stage once, in kill-chain order, with how many alerts hit it
+        # ("Recon x12 > Credential Access x11"), instead of a flip-flopping
+        # sequence that grows with every alert.
+        stage_counts = {}
         for _, st, _ in evs:
-            if not stages_seen or stages_seen[-1] != st:
-                stages_seen.append(st)
+            stage_counts[st] = stage_counts.get(st, 0) + 1
+        stages_seen = sorted(stage_counts)
         max_stage = max(st for _, st, _ in evs)
         mean_conf = sum(cf for *_, cf in evs) / len(evs)
         distinct = len(set(st for _, st, _ in evs))
@@ -169,7 +172,7 @@ class CampaignEngine:
             "risk": round(risk),
             "stage": c.last_stage,
             "stage_name": STAGES[c.last_stage],
-            "kill_chain": [STAGES[s] for s in stages_seen],
+            "kill_chain": [STAGES[st] + (f" ×{stage_counts[st]}" if stage_counts[st] > 1 else "") for st in stages_seen],
             "events": len(evs),
             "last_class": c.last_class,
             "age_s": round(age),

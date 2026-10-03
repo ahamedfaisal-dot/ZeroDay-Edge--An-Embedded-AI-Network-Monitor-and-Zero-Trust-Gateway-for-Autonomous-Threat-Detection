@@ -4,6 +4,7 @@
 #        sudo bash start.sh   (required for packet capture / iptables)
 #
 # Env overrides (see ml_engine.py / app.py for details):
+#   EDGE_KIOSK=0            Do not open the Chromium kiosk on the Pi screen (default: opens)
 #   EDGE_LITE_MODE=1        Skip deep-learning stages + SHAP (tree-ensemble only)
 #   EDGE_FLOW_INTERVAL=N    Seconds between flow-drain/classify passes (default 2)
 #   EDGE_WHITELIST=ip,ip    Never auto-block these IPs (e.g. your admin PC)
