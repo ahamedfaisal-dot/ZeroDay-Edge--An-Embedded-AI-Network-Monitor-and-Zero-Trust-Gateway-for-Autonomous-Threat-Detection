@@ -925,3 +925,23 @@ html, body {
 
 .shap-val.pos { color: var(--danger);  }
 .shap-val.neg { color: var(--success); }
+
+
+/* AI incident brief (Explain page) */
+.xai-brief { display: flex; flex-direction: column; gap: 3px; margin: 4px 0; max-height: 92px; overflow-y: auto; }
+.xai-brief:empty { display: none; }
+.brief-head { display: flex; align-items: center; gap: 6px; }
+.brief-cat { font-size: 11px; font-weight: 600; color: var(--text); }
+.brief-line { font-size: 10px; line-height: 1.35; color: var(--text); }
+.brief-line b { color: var(--accent); }
+.sev { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--border); }
+.sev-CRITICAL { color: var(--danger);  border-color: var(--danger); }
+.sev-HIGH     { color: #f97316;        border-color: #f97316; }
+.sev-MEDIUM   { color: var(--warning, #f59e0b); border-color: var(--warning, #f59e0b); }
+.sev-LOW      { color: var(--dim); }
+
+
+/* AI threat level + campaign line */
+.tl-text { font-size: 11px; font-weight: 600; white-space: nowrap; min-width: 64px; text-align: right; }
+.campaign-line { font-size: 9px; color: var(--muted); margin-top: 3px; line-height: 1.3; }
+.campaign-line b { color: var(--accent); }

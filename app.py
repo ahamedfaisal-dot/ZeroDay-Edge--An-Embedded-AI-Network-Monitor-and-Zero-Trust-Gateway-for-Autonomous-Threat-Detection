@@ -49,6 +49,9 @@ from flask_cors import CORS
 
 import db
 import firewall as fw
+from behavior import BehaviorModel
+from campaign import CampaignEngine
+from explain import explain_alert
 from ml_engine import MLEngine
 from network_scanner import NetworkScanner, is_protected_ip
 
@@ -69,6 +72,9 @@ app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0  # always revalidate JS/CSS after a 
 db.init_db()
 
 ml = MLEngine()
+behavior = BehaviorModel()
+campaigns = CampaignEngine()
+_PREEMPTIVE = os.environ.get("EDGE_PREEMPTIVE", "0") == "1"  # auto-block campaigns predicted to escalate
 scanner = NetworkScanner(interface=os.environ.get("EDGE_IFACE") or None)
 
 # Pre-load all ML models in a background thread so the server starts instantly
@@ -176,6 +182,10 @@ def _flow_drain_loop():
             db.insert_flows(flows)
             for result in results:
                 _handle_result(result)
+            # Adaptive per-device baseline: catches deviations no signature knows
+            for anomaly in behavior.observe(flows):
+                logger.warning("Behavioral anomaly: %s (%.0f%%)", anomaly["source_ip"], anomaly["confidence"] * 100)
+                _handle_result(anomaly)
         except Exception as e:
             logger.error("Flow drain error: %s", e)
 
@@ -192,6 +202,40 @@ def _health_log_loop():
         if h["capture_running"] and h["packets_seen"] == last:
             logger.warning("No packets captured in 15s — wrong interface? try EDGE_IFACE=wlan0 or eth0")
         last = h["packets_seen"]
+
+
+def _campaign_loop():
+    """
+    Feed every stored alert (heuristics, ML, WiFi, behavioural, manual ingest)
+    into the campaign correlator, so attacks are tracked as kill-chain
+    sequences rather than isolated events. Optionally (EDGE_PREEMPTIVE=1)
+    block an attacker whose campaign has escalated past EDGE_PREEMPT_RISK.
+    """
+    last_id = max(db.max_alert_id() - 200, 0)   # replay recent history so a restart keeps context
+    while True:
+        time.sleep(1.5)
+        try:
+            for a in db.get_alerts_since(last_id):
+                last_id = a["id"]
+                if a["threat_class"].lower() in ("benign", "normal"):
+                    continue
+                s = campaigns.record(a["source_ip"], a["threat_class"], a["confidence"], a["timestamp"])
+                if (_PREEMPTIVE and s["preempt_recommended"] and not is_protected_ip(a["source_ip"])
+                        and not db.is_ip_blocked(a["source_ip"])):
+                    logger.warning("Pre-emptive block: %s campaign risk %d, predicted next stage %s (%d%%)",
+                                   a["source_ip"], s["risk"], s["predicted_next"]["stage"],
+                                   s["predicted_next"]["probability"] * 100)
+                    _block_ip(a["source_ip"], reason="campaign:preemptive", auto=True)
+                    campaigns.mark_preempted(a["source_ip"])
+        except Exception as e:
+            logger.error("Campaign loop error: %s", e)
+
+
+def _baseline_save_loop():
+    while True:
+        time.sleep(300)
+        behavior.save()
+        campaigns.save()
 
 
 def _db_prune_loop():
@@ -226,6 +270,8 @@ def _start_background_threads():
         name="heuristics",
     ).start()
 
+    threading.Thread(target=_campaign_loop, daemon=True, name="campaigns").start()
+    threading.Thread(target=_baseline_save_loop, daemon=True, name="baseline-save").start()
     threading.Thread(target=_health_log_loop, daemon=True, name="health-log").start()
 
     # 3. Periodic ARP scan
@@ -256,6 +302,8 @@ def api_health():
     """Capture/ML liveness — first stop when detection looks dead."""
     return jsonify({
         "firewall_backend": fw.BACKEND,
+        "behavior_ai": behavior.status(),
+        "campaign_ai": {"preemptive": _PREEMPTIVE, **{k: v for k, v in campaigns.snapshot(0).items() if k != "campaigns"}},
         "capture": scanner.capture_health(),
         "ml_loaded": ml._loaded,
         "ml_stages": {
@@ -270,6 +318,7 @@ def api_health():
 def api_stats():
     """Aggregate KPI numbers for the dashboard, including real-time sniffer health."""
     stats = db.get_stats()
+    stats["ai"] = campaigns.snapshot()
     health = scanner.capture_health()
     stats["capture_running"] = health["capture_running"]
     stats["capture_error"] = health.get("error_message")
@@ -387,6 +436,8 @@ def api_xai(alert_id: int):
         "is_blocked":  bool(alert.get("is_blocked")),
         "timestamp":   alert.get("timestamp"),
         "xai_features": alert.get("xai_features", []),
+        "explanation": explain_alert(alert),
+        "campaign":    campaigns.for_ip(alert.get("source_ip")),
     })
 
 

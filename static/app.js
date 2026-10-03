@@ -172,10 +172,28 @@ async function fetchStats() {
   }
 
   // Last threat
-  renderLastThreat(data.last_alert);
+  renderThreatLevel(data.ai);
+  renderLastThreat(data.last_alert, data.ai);
 }
 
-function renderLastThreat(alert) {
+function renderThreatLevel(ai) {
+  if (!ai) return;
+  const fill = document.getElementById('tl-fill');
+  const txt  = document.getElementById('tl-text');
+  const lvl  = Number(ai.threat_level) || 0;
+  const col  = lvl >= 70 ? 'var(--danger)' : lvl >= 45 ? '#f97316' : lvl >= 20 ? '#f59e0b' : 'var(--success)';
+  if (fill) { fill.style.width = lvl + '%'; fill.style.background = col; }
+  if (txt)  { txt.textContent = `${lvl} · ${ai.label}`; txt.style.color = col; }
+}
+
+function campaignLine(c) {
+  if (!c) return '';
+  const chain = (c.kill_chain || []).join(' ▸ ');
+  const p = c.predicted_next || {};
+  return `<div class="campaign-line">⛓ ${esc(chain)} · risk <b>${c.risk}</b> · next: <b>${esc(p.stage || '?')}</b> ${Math.round((p.probability || 0) * 100)}%</div>`;
+}
+
+function renderLastThreat(alert, ai) {
   const el = document.getElementById('last-threat-body');
   if (!el) return;
 
@@ -197,6 +215,7 @@ function renderLastThreat(alert) {
       <span>${esc(alert.detected_by || '')}${alert.is_blocked ? ' · <span style="color:var(--danger)">BLOCKED</span>' : ''}</span>
       <button class="btn-quick-unblock" data-ip="${escAttr(alert.source_ip)}" style="padding:2px 8px;font-size:10px;background:rgba(239,68,68,0.15);border:1px solid var(--danger);border-radius:4px;color:var(--danger);cursor:pointer;font-weight:600">Unblock</button>
     </div>
+    ${campaignLine(((ai && ai.campaigns) || []).find(c => c.ip === alert.source_ip))}
   `;
 
   const btn = el.querySelector('.btn-quick-unblock');
@@ -484,6 +503,7 @@ document.getElementById('xai-select')?.addEventListener('change', async function
   const id = this.value;
   if (!id) {
     setHTML('xai-meta', '');
+    setHTML('xai-brief', '');
     setHTML('xai-bars', '<div class="empty">Select an alert to see AI explanation</div>');
     return;
   }
@@ -492,6 +512,20 @@ document.getElementById('xai-select')?.addEventListener('change', async function
   if (!data) return;
   renderXai(data);
 });
+
+function renderBrief(x, campaign) {
+  if (!x) { setHTML('xai-brief', ''); return; }
+  setHTML('xai-brief', `
+    <div class="brief-head">
+      <span class="sev sev-${esc(x.severity)}">${esc(x.severity)}</span>
+      <span class="brief-cat">${esc(x.category)}</span>
+    </div>
+    <div class="brief-line">${esc(x.summary)}</div>
+    <div class="brief-line c-dim">${esc(x.evidence)}</div>
+    <div class="brief-line"><b>Action:</b> ${esc(x.recommendation)}</div>
+    ${campaign ? `<div class="brief-line"><b>Kill chain:</b> ${esc((campaign.kill_chain || []).join(' ▸ '))} · campaign risk ${campaign.risk}/100 · AI predicts next: <b>${esc(campaign.predicted_next.stage)}</b> (${Math.round(campaign.predicted_next.probability * 100)}%)</div>` : ''}
+  `);
+}
 
 function renderXai(data) {
   const col  = threatColour(data.threat_class);
@@ -503,6 +537,8 @@ function renderXai(data) {
     <span class="c-dim">${esc(data.detected_by || '')}</span>
     ${data.is_blocked ? '<span class="c-danger">● BLOCKED</span>' : ''}
   `);
+
+  renderBrief(data.explanation, data.campaign);
 
   const bars = document.getElementById('xai-bars');
   if (!bars) return;

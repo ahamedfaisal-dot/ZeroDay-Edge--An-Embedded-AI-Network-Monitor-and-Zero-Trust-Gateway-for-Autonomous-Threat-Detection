@@ -166,7 +166,7 @@ class _FlowStats:
 
     __slots__ = (
         "start_time", "last_time", "initiator", "peer_ip",
-        "fwd_pkts", "bwd_pkts", "fwd_bytes", "bwd_bytes",
+        "peer_port", "fwd_pkts", "bwd_pkts", "fwd_bytes", "bwd_bytes",
         "fwd_len", "bwd_len", "pkt_len",
         "flow_iat", "fwd_iat", "bwd_iat", "last_fwd_time", "last_bwd_time",
         "fwd_header_bytes", "bwd_header_bytes", "min_fwd_header_bytes",
@@ -180,6 +180,7 @@ class _FlowStats:
         self.last_time = now
         self.initiator = None
         self.peer_ip = None
+        self.peer_port = 0
         self.fwd_pkts = 0
         self.bwd_pkts = 0
         self.fwd_bytes = 0
@@ -210,10 +211,11 @@ class _FlowStats:
         self.fwd_data_pkts = 0
 
     def add_packet(self, src: str, sport: int, dst: str, pkt_len: int,
-                    header_len: int, payload_len: int, tcp_layer, now: float):
+                    header_len: int, payload_len: int, tcp_layer, now: float, dport: int = 0):
         if self.initiator is None:
             self.initiator = (src, sport)
             self.peer_ip = dst
+            self.peer_port = dport
         is_fwd = (src, sport) == self.initiator
 
         if now > self.last_time:
@@ -279,6 +281,7 @@ class _FlowStats:
         return {
             "source_ip": src_ip,
             "destination_ip": dst_ip,
+            "destination_port": self.peer_port,
             # snake_case shortcuts — kept for db.insert_flow()/app.py compatibility
             "flow_duration": duration_s * 1e6,
             "total_fwd_packets": self.fwd_pkts,
@@ -603,7 +606,7 @@ class NetworkScanner:
             with _flow_lock:
                 if key not in _flow_table and len(_flow_table) >= _MAX_FLOW_TABLE_ENTRIES:
                     return  # table full — this flow's stats resume next drain window
-                _flow_table[key].add_packet(src, sport, dst, pkt_len, header_len, payload_len, tcp_layer, now)
+                _flow_table[key].add_packet(src, sport, dst, pkt_len, header_len, payload_len, tcp_layer, now, dport)
 
                 scan_entry = _scan_table[(src, dst)]
                 scan_entry["ports"].add(dport)

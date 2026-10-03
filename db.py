@@ -235,6 +235,28 @@ def get_recent_alerts(limit: int = 20, threats_only: bool = False) -> list[dict]
     return rows
 
 
+def max_alert_id() -> int:
+    conn = _get_conn()
+    try:
+        return conn.execute("SELECT COALESCE(MAX(id), 0) FROM threat_alerts").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def get_alerts_since(last_id: int, limit: int = 500) -> list[dict]:
+    """Alerts with id > last_id, oldest first (feeds the campaign correlator)."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT id, source_ip, threat_class, confidence, timestamp
+               FROM threat_alerts WHERE id > ? ORDER BY id ASC LIMIT ?""",
+            (last_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_alert_by_id(alert_id: int) -> dict | None:
     conn = _get_conn()
     c = conn.cursor()

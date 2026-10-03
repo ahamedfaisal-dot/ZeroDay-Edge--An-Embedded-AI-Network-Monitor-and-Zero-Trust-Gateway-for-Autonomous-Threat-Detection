@@ -75,6 +75,15 @@
         </div>
       </div>
 
+      <!-- AI Threat Level (campaign correlation) -->
+      <div class="conf-row" id="threat-level-row">
+        <span class="conf-label">AI Threat Level</span>
+        <div class="conf-track">
+          <div class="conf-fill" id="tl-fill" style="width:0%"></div>
+        </div>
+        <span class="tl-text" id="tl-text">0 · CALM</span>
+      </div>
+
       <!-- AI Confidence Bar -->
       <div class="conf-row">
         <span class="conf-label">AI Confidence</span>
@@ -179,6 +188,9 @@
 
       <!-- Alert meta (populated after selection) -->
       <div class="xai-meta" id="xai-meta"></div>
+
+      <!-- AI incident brief -->
+      <div class="xai-brief" id="xai-brief"></div>
 
       <!-- SHAP bars -->
       <div class="xai-bars" id="xai-bars">
