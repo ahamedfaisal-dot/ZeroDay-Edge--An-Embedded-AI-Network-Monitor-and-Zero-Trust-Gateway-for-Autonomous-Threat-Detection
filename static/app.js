@@ -191,8 +191,28 @@ function renderLastThreat(alert) {
       <span class="threat-class">${esc(alert.threat_class)}</span>
       <span class="threat-conf c-${col}">${conf}</span>
     </div>
-    <div class="threat-model">${esc(alert.detected_by || '')}${alert.is_blocked ? ' · <span style="color:var(--danger)">BLOCKED</span>' : ''}</div>
+    <div class="threat-model" style="display:flex;align-items:center;justify-content:space-between;margin-top:4px">
+      <span>${esc(alert.detected_by || '')}${alert.is_blocked ? ' · <span style="color:var(--danger)">BLOCKED</span>' : ''}</span>
+      <button class="btn-quick-unblock" data-ip="${escAttr(alert.source_ip)}" style="padding:2px 8px;font-size:10px;background:rgba(239,68,68,0.15);border:1px solid var(--danger);border-radius:4px;color:var(--danger);cursor:pointer;font-weight:600">Unblock</button>
+    </div>
   `;
+
+  const btn = el.querySelector('.btn-quick-unblock');
+  if (btn) {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const ip = btn.dataset.ip;
+      btn.textContent = '…';
+      btn.disabled = true;
+      try {
+        await fetch(API.unblock(ip), { method: 'POST' });
+      } catch (err) {
+        console.error('Failed to unblock:', err);
+      }
+      await fetchBlocked();
+      await fetchStats();
+    });
+  }
 }
 
 async function fetchDashboardFeed() {
@@ -392,7 +412,7 @@ async function fetchBlocked() {
     return;
   }
 
-  el.innerHTML = data.slice(0, 4).map(b => {
+  el.innerHTML = data.map(b => {
     const type = b.auto_blocked ? 'AUTO' : 'MANUAL';
     const time = fmtTime(b.blocked_at);
     return `<div class="blocked-row">
@@ -409,8 +429,13 @@ async function fetchBlocked() {
       const ip = btn.dataset.ip;
       btn.textContent = '…';
       btn.disabled = true;
-      await fetch(API.unblock(ip), { method: 'POST' });
+      try {
+        await fetch(API.unblock(ip), { method: 'POST' });
+      } catch (err) {
+        console.error('Failed to unblock:', err);
+      }
       await fetchBlocked();
+      await fetchStats();
     });
   });
 }

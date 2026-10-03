@@ -116,19 +116,24 @@ def _iptables(action: str, ip: str) -> bool:
         return False
 
 
-def _block_ip(ip: str, reason: str = "auto", auto: bool = True):
+def _block_ip(ip: str, reason: str = "auto", auto: bool = True) -> bool:
     if auto and is_protected_ip(ip):
         logger.warning("Refusing to auto-block protected IP %s (%s)", ip, reason)
-        return
-    _iptables("-A", ip)
-    db.add_blocked_ip(ip, reason=reason, auto=auto)
-    logger.info("Blocked %s (%s)", ip, reason)
+        return False
+    if not db.is_ip_blocked(ip):
+        _iptables("-A", ip)
+        db.add_blocked_ip(ip, reason=reason, auto=auto)
+        logger.info("Blocked %s (%s)", ip, reason)
+    return True
 
 
 def _unblock_ip(ip: str):
-    _iptables("-D", ip)
+    # Repeat -D up to 20 times to thoroughly purge any duplicate iptables rules
+    for _ in range(20):
+        if not _iptables("-D", ip):
+            break
     db.remove_blocked_ip(ip)
-    logger.info("Unblocked %s", ip)
+    logger.info("Unblocked %s (all iptables rules purged)", ip)
 
 
 # ── Classification Helper ─────────────────────────────────────────────────
@@ -137,10 +142,13 @@ def _handle_result(result: dict):
     """Persist a threat result, auto-block, and apply Zero Trust penalty."""
     if result.get("threat_class", "Benign").lower() in ("benign", "normal"):
         return
-    db.insert_alert(result)
     ip = result["source_ip"]
-    if result.get("is_blocked") and not db.is_ip_blocked(ip):
-        _block_ip(ip, reason="auto", auto=True)
+    if result.get("is_blocked"):
+        if is_protected_ip(ip):
+            result["is_blocked"] = False
+        else:
+            _block_ip(ip, reason="auto", auto=True)
+    db.insert_alert(result)
 
     # Zero Trust: degrade this device's trust score
     new_score = db.penalise_device(ip=ip, confidence=float(result.get("confidence", 0.5)))
@@ -177,10 +185,13 @@ def _heuristic_loop():
         time.sleep(_HEURISTIC_INTERVAL)
         try:
             for result in scanner.drain_burst_alerts() + scanner.drain_bruteforce_alerts():
-                db.insert_alert(result)
                 ip = result["source_ip"]
-                if result.get("is_blocked") and not db.is_ip_blocked(ip):
-                    _block_ip(ip, reason="heuristic:" + result["detected_by"], auto=True)
+                if result.get("is_blocked"):
+                    if is_protected_ip(ip):
+                        result["is_blocked"] = False
+                    else:
+                        _block_ip(ip, reason="heuristic:" + result["detected_by"], auto=True)
+                db.insert_alert(result)
                 db.penalise_device(ip=ip, confidence=float(result.get("confidence", 0.5)))
         except Exception as e:
             logger.error("Heuristic loop error: %s", e)
@@ -378,7 +389,7 @@ def api_block(ip: str):
     })
 
 
-@app.route("/api/unblock/<ip>", methods=["POST"])
+@app.route("/api/unblock/<ip>", methods=["POST", "GET"])
 def api_unblock(ip: str):
     """Manually unblock an IP."""
     _unblock_ip(ip)

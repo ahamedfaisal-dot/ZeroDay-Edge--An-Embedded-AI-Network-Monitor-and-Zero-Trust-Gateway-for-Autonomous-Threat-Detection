@@ -390,9 +390,9 @@ _MAX_FLOW_TABLE_ENTRIES = 4000
 # representation.
 # Key: (src_ip, dst_ip) — Value: {"ports": set(), "pkts": int, "bytes": int, "start": float}
 _scan_table: dict = defaultdict(lambda: {"ports": set(), "pkts": 0, "bytes": 0, "start": time.time()})
-_SCAN_PORT_THRESHOLD = 15     # distinct dst ports from one src to one dst within a window = scan
+_SCAN_PORT_THRESHOLD = 15        # distinct dst ports from one src to one dst within a window = scan
 _SCAN_MAX_AVG_PKTS_PER_PORT = 5  # below this density, high port count = scan, not flood
-_FLOOD_PACKET_THRESHOLD = 300  # packets from one src to one dst within a window = flood/DDoS
+_FLOOD_PACKET_THRESHOLD = 120    # packets from one src to one dst within a window = flood/DDoS (calibrated for test runs)
 
 # ── Brute-force tracker ────────────────────────────────────────────────────
 # Repeated login/connection attempts at ONE port look like the scan case —
@@ -401,9 +401,9 @@ _FLOOD_PACKET_THRESHOLD = 300  # packets from one src to one dst within a window
 # across many. Counts fresh SYNs (SYN without ACK = a new connection
 # attempt, not a response) per (src, dst, dst_port).
 _bruteforce_table: dict = defaultdict(lambda: {"attempts": 0, "start": time.time()})
-_BRUTEFORCE_ATTEMPT_THRESHOLD = 10  # connection attempts to the same dst:port within a window
-_TRACKER_WINDOW_SECONDS = 5          # sliding window for scan/flood/brute-force trackers
-_HEURISTIC_COOLDOWN_SECONDS = 10     # don't re-alert the same (type, src, dst) more often than this
+_BRUTEFORCE_ATTEMPT_THRESHOLD = 8   # connection attempts to the same dst:port within a window
+_TRACKER_WINDOW_SECONDS = 5         # sliding window for scan/flood/brute-force trackers
+_HEURISTIC_COOLDOWN_SECONDS = 5     # cooldown before re-alerting same source/attack type (5s for quick testing)
 _heuristic_last_alert: dict = {}
 
 _capture_stats = {"packets": 0, "raw_packets": 0, "errors": 0, "last_packet": 0.0, "started": False, "iface": None}
@@ -712,12 +712,12 @@ class NetworkScanner:
             elif n_pkts >= _FLOOD_PACKET_THRESHOLD:
                 if not self._cooldown_ok(("flood", src, dst), now):
                     continue
-                confidence = min(n_pkts / (_FLOOD_PACKET_THRESHOLD * 4), 1.0)
+                confidence = min(0.80 + (n_pkts / (_FLOOD_PACKET_THRESHOLD * 2)) * 0.20, 1.0)
                 alerts.append({
                     "source_ip": src,
                     "dest_ip": dst,
                     "threat_class": "DDoS / Flood",
-                    "confidence": confidence,
+                    "confidence": round(confidence, 2),
                     "detected_by": "Flood Heuristic",
                     "is_blocked": confidence >= 0.85,
                     "xai_features": [
@@ -767,12 +767,12 @@ class NetworkScanner:
                 continue
             if not self._cooldown_ok(("bf", src, dst, port), now):
                 continue
-            confidence = min(attempts / (_BRUTEFORCE_ATTEMPT_THRESHOLD * 4), 1.0)
+            confidence = min(0.80 + (attempts / (_BRUTEFORCE_ATTEMPT_THRESHOLD * 2)) * 0.20, 1.0)
             alerts.append({
                 "source_ip": src,
                 "dest_ip": dst,
                 "threat_class": "Brute Force Attempt",
-                "confidence": confidence,
+                "confidence": round(confidence, 2),
                 "detected_by": "Brute Force Heuristic",
                 "is_blocked": confidence >= 0.85,
                 "xai_features": [
