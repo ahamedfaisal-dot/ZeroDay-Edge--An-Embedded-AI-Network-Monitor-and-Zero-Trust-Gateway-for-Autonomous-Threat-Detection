@@ -954,3 +954,25 @@ html, body {
 #p-dashboard::-webkit-scrollbar { width: 4px; }
 #p-dashboard::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 .campaign-line { word-break: break-word; }
+
+
+/* ── Decoy honeypot page ─────────────────────────────────────────────── */
+.hp-ports { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
+.hp-live  { font-size: 9px; font-weight: 700; color: var(--success); letter-spacing: 0.05em; }
+.hp-chip  {
+  font-family: var(--mono); font-size: 10px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 10px; padding: 1px 8px;
+}
+.hp-chip.off { color: var(--danger); border-color: var(--danger); }
+.hp-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; }
+.hp-row {
+  background: var(--surface); border: 1px solid var(--border);
+  border-left: 3px solid var(--warning); border-radius: var(--radius);
+  padding: 6px 9px; flex-shrink: 0;
+}
+.hp-row.hp-cred { border-left-color: var(--danger); }
+.hp-top { display: flex; align-items: center; gap: 7px; }
+.hp-top .ts-small { margin-left: auto; }
+.hp-svc { font-family: var(--mono); font-size: 10px; color: var(--dim); }
+.hp-creds { display: block; margin-top: 3px; font-family: var(--mono); font-size: 10px; color: var(--danger); word-break: break-all; }
+.hp-req   { display: block; margin-top: 3px; font-size: 9px; color: var(--dim); word-break: break-all; }

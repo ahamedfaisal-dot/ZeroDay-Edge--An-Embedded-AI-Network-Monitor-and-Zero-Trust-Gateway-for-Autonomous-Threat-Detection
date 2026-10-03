@@ -53,6 +53,8 @@ _PRIOR = [
 
 def stage_of(threat_class: str) -> int:
     t = (threat_class or "").lower().replace(" ", "")
+    if "honeypot" in t:                       # credential capture = credential attack, bare probe = recon
+        return 1 if "credential" in t else 0
     if "ddos" in t or "flood" in t:          # incl. Beacon Flood, "PortScan / DDoS"
         return 3
     if "portscan" in t or "recon" in t:

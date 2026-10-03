@@ -27,6 +27,7 @@ const API = {
   block:     (ip)  => `/api/block/${encodeURIComponent(ip)}`,
   unblock:   (ip)  => `/api/unblock/${encodeURIComponent(ip)}`,
   clear:     '/api/clear',
+  honeypot:  '/api/honeypot',
 };
 
 /* ── State ────────────────────────────────────────────────────────────── */
@@ -129,6 +130,7 @@ function switchPage(page) {
   if (page === 'blocked') { renderBlocked(blockedCache); fetchBlocked(); }
   if (page === 'network') fetchNetwork();
   if (page === 'xai')     populateXaiSelect();
+  if (page === 'honeypot') fetchHoneypot();
 }
 
 document.querySelectorAll('.nav-tab').forEach(tab => {
@@ -577,6 +579,61 @@ function renderXai(data) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════ */
+/* DECOY HONEYPOT PAGE                                                     */
+/* ══════════════════════════════════════════════════════════════════════ */
+
+async function fetchHoneypot() {
+  const d = await fetchJSON(API.honeypot);
+  if (!d) return;
+
+  setText('hp-hits',      fmtNum(d.total_hits));
+  setText('hp-creds',     fmtNum(d.credential_captures));
+  setText('hp-attackers', fmtNum(d.unique_attackers));
+  const badge = document.getElementById('hp-badge');
+  if (badge) {
+    badge.textContent = d.total_hits;
+    badge.className = 'badge' + (d.total_hits > 0 ? ' badge-danger' : '');
+  }
+
+  const ports = document.getElementById('hp-ports');
+  if (ports) {
+    if (!d.enabled) {
+      ports.innerHTML = '<span class="hp-chip off">Honeypot disabled</span>';
+    } else if (!d.listening_ports.length) {
+      ports.innerHTML = '<span class="hp-chip off">No decoy ports could be opened</span>';
+    } else {
+      ports.innerHTML = '<span class="hp-live">● LIVE</span>' + d.listening_ports.map(p =>
+        `<span class="hp-chip">:${p} ${esc((d.services || {})[p] || '')}</span>`).join('');
+    }
+  }
+
+  if (activePage !== 'honeypot') return;
+  const el = document.getElementById('hp-list');
+  if (!el) return;
+  if (!d.events.length) {
+    el.innerHTML = '<div class="empty">No one has touched the decoys yet</div>';
+    return;
+  }
+
+  el.innerHTML = d.events.map(e => {
+    const cred = /credential/i.test(e.threat_class);
+    const tried = (e.credentials || []).length
+      ? `<span class="hp-creds">tried: ${(e.credentials || []).map(esc).join(' &nbsp;|&nbsp; ')}</span>`
+      : (e.request ? `<span class="hp-req">${esc(e.request)}</span>` : '');
+    return `<div class="hp-row${cred ? ' hp-cred' : ''}">
+      <div class="hp-top">
+        <span class="blocked-ip">${esc(e.source_ip)}</span>
+        <span class="threat-pill ${cred ? 'pill-danger' : 'pill-warning'}">${cred ? 'Login attempt' : 'Probe'}</span>
+        <span class="hp-svc">${esc(e.service || '')}</span>
+        ${e.is_blocked ? '<span class="blocked-tag">BLOCKED</span>' : ''}
+        <span class="ts-small">${fmtTime(e.timestamp)}</span>
+      </div>
+      ${tried}
+    </div>`;
+  }).join('');
+}
+
+/* ══════════════════════════════════════════════════════════════════════ */
 /* POLLING INTERVALS                                                       */
 /* ══════════════════════════════════════════════════════════════════════ */
 
@@ -607,6 +664,7 @@ fetchBlocked();
 setInterval(guarded('dash',    pollDashboard), 1000);  // stats + mini feed
 setInterval(guarded('alerts',  pollAlerts),    1500);  // alerts list
 setInterval(guarded('blocked', fetchBlocked),  2000);  // blocked IPs
+setInterval(guarded('hp',      fetchHoneypot), 2000);  // decoy honeypot (also keeps the tab badge live)
 
 // Network page auto-refresh when visible
 setInterval(guarded('net', async () => {

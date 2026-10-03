@@ -235,6 +235,38 @@ def get_recent_alerts(limit: int = 20, threats_only: bool = False) -> list[dict]
     return rows
 
 
+def get_honeypot_summary(limit: int = 40) -> dict:
+    """Counters + recent visitors of the deception honeypot (from stored alerts)."""
+    conn = _get_conn()
+    try:
+        det = "Deception Honeypot"
+        total = conn.execute("SELECT COUNT(*) FROM threat_alerts WHERE detected_by = ?", (det,)).fetchone()[0]
+        creds = conn.execute(
+            "SELECT COUNT(*) FROM threat_alerts WHERE detected_by = ? AND threat_class LIKE '%Credential%'", (det,)
+        ).fetchone()[0]
+        attackers = conn.execute(
+            "SELECT COUNT(DISTINCT source_ip) FROM threat_alerts WHERE detected_by = ?", (det,)
+        ).fetchone()[0]
+        rows = conn.execute(
+            """SELECT id, source_ip, dest_ip, threat_class, confidence, is_blocked, xai_data, timestamp
+               FROM threat_alerts WHERE detected_by = ? ORDER BY id DESC LIMIT ?""", (det, limit)
+        ).fetchall()
+        events = []
+        for r in rows:
+            d = dict(r)
+            try:
+                feats = json.loads(d.pop("xai_data") or "[]")
+            except Exception:
+                feats = []
+            svc = next((f["raw_value"] for f in feats if f.get("name") == "decoy_service"), "")
+            tried = [str(f["raw_value"]) for f in feats if f.get("name") == "credentials_tried"]
+            req = next((str(f["raw_value"]) for f in feats if f.get("name") == "request"), "")
+            events.append({**d, "service": svc, "credentials": tried, "request": req})
+        return {"total_hits": total, "credential_captures": creds, "unique_attackers": attackers, "events": events}
+    finally:
+        conn.close()
+
+
 def max_alert_id() -> int:
     conn = _get_conn()
     try:

@@ -43,6 +43,13 @@ _PLAYBOOK = {
         "or confuse WiFi clients.",
         "Identify the broadcasting device; temporarily move critical devices to a wired link.",
     ),
+    "honeypot": (
+        "Deception trigger (high-fidelity)",
+        "{ip} connected to a decoy service on this node ({dst}) that no legitimate device uses — "
+        "an attacker probing for weak remote-access services or trying default passwords.",
+        "Treat the source as hostile: keep it blocked, check whether the same host reached anything real, "
+        "and review the credentials it tried (they may reveal a password list in use).",
+    ),
     "malicious": (
         "Malicious traffic",
         "The traffic from {ip} to {dst} matches patterns the trained models associate with attacks.",
@@ -53,6 +60,8 @@ _PLAYBOOK = {
 
 def _kind(threat_class: str) -> str:
     t = (threat_class or "").lower().replace(" ", "")
+    if "honeypot" in t:
+        return "honeypot"
     if "beacon" in t:
         return "beacon"
     if "evil" in t or "rogue" in t:

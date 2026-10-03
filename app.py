@@ -53,7 +53,8 @@ from behavior import BehaviorModel
 from campaign import CampaignEngine
 from explain import explain_alert
 from ml_engine import MLEngine
-from network_scanner import NetworkScanner, is_protected_ip
+from network_scanner import NetworkScanner, is_protected_ip, LOCAL_IP
+from honeypot import Honeypot
 
 # ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -127,6 +128,56 @@ def _handle_result(result: dict):
     new_score = db.penalise_device(ip=ip, confidence=float(result.get("confidence", 0.5)))
     if new_score is not None and new_score <= 0 and not db.is_ip_blocked(ip):
         _block_ip(ip, reason="zero-trust-score", auto=True)
+
+
+# ── Deception honeypot ────────────────────────────────────────────────────
+_decoy_seen: dict = {}      # ip -> {"ports": set, "t": last_seen}
+_decoy_lock = threading.Lock()
+
+
+def _honeypot_event(ev: dict):
+    """
+    A decoy service was touched — hostile by definition. Alert at once; BLOCK when
+    the visitor tried credentials or touched 2+ distinct decoys within a minute
+    (a lone probe could be a LAN device that wandered onto e.g. :8080).
+    """
+    ip, creds = ev["src_ip"], ev["credentials"]
+    now = time.time()
+    with _decoy_lock:
+        rec = _decoy_seen.setdefault(ip, {"ports": set(), "t": now})
+        if now - rec["t"] > 60:
+            rec["ports"].clear()
+        rec["t"] = now
+        rec["ports"].add(ev["port"])
+        multi = len(rec["ports"]) >= 2
+        if len(_decoy_seen) > 1000:
+            for k in [k for k, v in _decoy_seen.items() if now - v["t"] > 300]:
+                del _decoy_seen[k]
+
+    feats = [{"name": "decoy_service", "raw_value": f"{ev['service']}/{ev['port']}", "impact": 1.0}]
+    for user, pw in creds[:3]:
+        feats.append({"name": "credentials_tried", "raw_value": f"{user or '-'} / {pw or '-'}", "impact": 0.8})
+    if len(rec["ports"]) > 1:
+        feats.append({"name": "distinct_decoys_touched", "raw_value": len(rec["ports"]), "impact": 0.7})
+    if ev.get("detail") and not creds:
+        feats.append({"name": "request", "raw_value": ev["detail"], "impact": 0.3})
+
+    result = {
+        "source_ip": ip,
+        "dest_ip": f"{LOCAL_IP}:{ev['port']}",
+        "threat_class": "Honeypot Credential Capture" if creds else "Honeypot Probe",
+        "confidence": 0.99 if (creds or multi) else 0.92,
+        "detected_by": "Deception Honeypot",
+        "is_blocked": bool(creds or multi),
+        "xai_features": feats,
+        "timestamp": ev["timestamp"],
+    }
+    logger.warning("HONEYPOT: %s hit decoy %s/%d%s", ip, ev["service"], ev["port"],
+                   f" — creds tried: {creds[:2]}" if creds else "")
+    _handle_result(result)
+
+
+honeypot = Honeypot(_honeypot_event, ignore_ips={LOCAL_IP}) if os.environ.get("EDGE_HONEYPOT", "1") != "0" else None
 
 
 def _classify_and_store(flow_data: dict) -> dict:
@@ -270,6 +321,8 @@ def _start_background_threads():
         name="heuristics",
     ).start()
 
+    if honeypot:
+        honeypot.start()
     threading.Thread(target=_campaign_loop, daemon=True, name="campaigns").start()
     threading.Thread(target=_baseline_save_loop, daemon=True, name="baseline-save").start()
     threading.Thread(target=_health_log_loop, daemon=True, name="health-log").start()
@@ -303,6 +356,7 @@ def api_health():
     return jsonify({
         "firewall_backend": fw.BACKEND,
         "behavior_ai": behavior.status(),
+        "honeypot": honeypot.status() if honeypot else {"enabled": False},
         "campaign_ai": {"preemptive": _PREEMPTIVE, **{k: v for k, v in campaigns.snapshot(0).items() if k != "campaigns"}},
         "capture": scanner.capture_health(),
         "ml_loaded": ml._loaded,
@@ -312,6 +366,16 @@ def api_health():
             "bilstm": ml.bilstm is not None,
         },
     })
+
+
+@app.route("/api/honeypot")
+def api_honeypot():
+    """Decoy status + counters + recent visitors with the credentials they tried."""
+    out = db.get_honeypot_summary(limit=request.args.get("limit", 40, type=int))
+    out["enabled"] = honeypot is not None
+    out["listening_ports"] = honeypot.listening if honeypot else []
+    out["services"] = {str(p): s for p, s in (honeypot._ports if honeypot else [])}
+    return jsonify(out)
 
 
 @app.route("/api/stats")

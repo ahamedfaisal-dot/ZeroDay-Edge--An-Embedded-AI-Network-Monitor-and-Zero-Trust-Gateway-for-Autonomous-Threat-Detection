@@ -170,6 +170,41 @@
 
 
     <!-- ──────────────────────────────────────────────────────────────
+         PAGE · DECOY HONEYPOT
+         Fake Telnet/FTP/web-admin services: any visitor is hostile
+         ────────────────────────────────────────────────────────── -->
+    <section class="page" id="p-honeypot">
+
+      <div class="page-header">
+        <span class="section-title">Decoy Honeypot</span>
+        <span class="badge" id="hp-badge">0</span>
+      </div>
+
+      <div class="kpi-row">
+        <div class="kpi-card">
+          <div class="kpi-value" id="hp-hits">—</div>
+          <div class="kpi-label">Hits</div>
+        </div>
+        <div class="kpi-card threats">
+          <div class="kpi-value" id="hp-creds">—</div>
+          <div class="kpi-label">Logins tried</div>
+        </div>
+        <div class="kpi-card blocked">
+          <div class="kpi-value" id="hp-attackers">—</div>
+          <div class="kpi-label">Attackers</div>
+        </div>
+      </div>
+
+      <div class="hp-ports" id="hp-ports"></div>
+
+      <div class="hp-list" id="hp-list">
+        <div class="empty">No one has touched the decoys yet</div>
+      </div>
+
+    </section><!-- /p-honeypot -->
+
+
+    <!-- ──────────────────────────────────────────────────────────────
          PAGE 5 · XAI EXPLAINER
          SHAP feature importance bars for any selected alert
          ────────────────────────────────────────────────────────── -->
@@ -252,6 +287,17 @@
         <line x1="4" y1="4" x2="12" y2="12"/>
       </svg>
       Blocked
+    </button>
+
+    <button class="nav-tab" id="t-honeypot"
+            data-page="honeypot" aria-label="Decoy honeypot">
+      <svg class="nav-icon" width="16" height="16" viewBox="0 0 16 16"
+           fill="none" stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M8 1.5l5.2 3v6L8 13.5l-5.2-3v-6L8 1.5z"/>
+        <circle cx="8" cy="7.5" r="1.6"/>
+      </svg>
+      Decoy
     </button>
 
     <button class="nav-tab" id="t-xai"
