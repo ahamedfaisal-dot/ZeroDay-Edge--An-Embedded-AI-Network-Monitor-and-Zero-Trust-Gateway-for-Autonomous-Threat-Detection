@@ -10,15 +10,16 @@
 #   EDGE_ARP_INTERVAL=N     Seconds between ARP scans (default 60)
 #   EDGE_ML_THREADS=N       Thread cap for XGBoost/RF/tflite (default 2)
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+
 # Require root for packet capture (Scapy raw sockets) and iptables blocking
 if [ "$EUID" -ne 0 ]; then
     echo "Notice: ZeroDay-Edge packet capture (Scapy) and auto-blocking (iptables) require root privileges."
     echo "Auto-elevating with sudo (password: pi)..."
-    echo "pi" | sudo -S -E "$0" "$@"
+    echo "pi" | sudo -S -E bash "$SCRIPT_PATH" "$@"
     exit $?
 fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 [ -f "$VENV_PYTHON" ] || VENV_PYTHON="$SCRIPT_DIR/venv/bin/python"
 
