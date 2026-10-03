@@ -16,6 +16,7 @@ Two responsibilities:
 """
 
 import logging
+import os
 import re
 import shutil
 import socket
@@ -68,6 +69,33 @@ def _get_local_ip() -> str:
 
 
 LOCAL_IP = _get_local_ip()
+
+
+def _get_gateway_ip() -> str | None:
+    """Default gateway from /proc/net/route (Linux); None elsewhere."""
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                p = line.split()
+                if p[1] == "00000000":
+                    return socket.inet_ntoa(bytes.fromhex(p[2])[::-1])
+    except Exception:
+        pass
+    return None
+
+
+# IPs that must never be auto-blocked: this node, its gateway, and anything
+# listed in EDGE_WHITELIST (comma-separated) — e.g. the admin's PC, so an
+# SSH/dashboard session can't lock the operator out.
+PROTECTED_IPS = {LOCAL_IP, "127.0.0.1", "0.0.0.0"}
+_gw = _get_gateway_ip()
+if _gw:
+    PROTECTED_IPS.add(_gw)
+PROTECTED_IPS.update(x.strip() for x in os.environ.get("EDGE_WHITELIST", "").split(",") if x.strip())
+
+
+def is_protected_ip(ip: str) -> bool:
+    return ip in PROTECTED_IPS or ip.startswith(("224.", "239.", "255.")) or ip.endswith(".255")
 
 
 class _RunningStats:
@@ -331,6 +359,11 @@ _FLOOD_PACKET_THRESHOLD = 300  # packets from one src to one dst within a window
 # attempt, not a response) per (src, dst, dst_port).
 _bruteforce_table: dict = defaultdict(lambda: {"attempts": 0, "start": time.time()})
 _BRUTEFORCE_ATTEMPT_THRESHOLD = 10  # connection attempts to the same dst:port within a window
+_TRACKER_WINDOW_SECONDS = 5          # sliding window for scan/flood/brute-force trackers
+_HEURISTIC_COOLDOWN_SECONDS = 10     # don't re-alert the same (type, src, dst) more often than this
+_heuristic_last_alert: dict = {}
+
+_capture_stats = {"packets": 0, "errors": 0, "last_packet": 0.0, "started": False, "iface": None}
 
 # ARP scan results cache
 _devices_cache: list[dict] = []
@@ -375,6 +408,8 @@ class NetworkScanner:
             return
 
         self._sniff_running = True
+        _capture_stats["started"] = True
+        _capture_stats["iface"] = self.interface or "auto"
         logger.info("Starting packet capture (interface=%s)…", self.interface or "auto")
 
         kwargs: dict = {
@@ -388,11 +423,13 @@ class NetworkScanner:
         try:
             sniff(**kwargs)  # blocks forever
         except PermissionError:
+            _capture_stats["started"] = False
             logger.error(
                 "Packet capture requires root privileges. "
                 "Run with: sudo python app.py"
             )
         except Exception as e:
+            _capture_stats["started"] = False
             logger.error("Capture error: %s", e)
 
     def _handle_packet(self, pkt):
@@ -409,21 +446,24 @@ class NetworkScanner:
                 return
             if src == LOCAL_IP and dst == LOCAL_IP:
                 return
+            # Multicast/broadcast (mDNS, SSDP, DHCP) is noise, not attack traffic
+            if dst.startswith(("224.", "239.", "255.")) or dst.endswith(".255"):
+                return
 
             tcp_layer = pkt[TCP] if pkt.haslayer(TCP) else None
             udp_layer = pkt[UDP] if pkt.haslayer(UDP) else None
 
             if tcp_layer is not None:
                 sport, dport = tcp_layer.sport, tcp_layer.dport
-                header_len = ip.ihl * 4 + tcp_layer.dataofs * 4
+                header_len = (ip.ihl or 5) * 4 + (tcp_layer.dataofs or 5) * 4
                 payload_len = len(tcp_layer.payload)
             elif udp_layer is not None:
                 sport, dport = udp_layer.sport, udp_layer.dport
-                header_len = ip.ihl * 4 + 8
+                header_len = (ip.ihl or 5) * 4 + 8
                 payload_len = len(udp_layer.payload)
             else:
                 sport, dport = 0, 0
-                header_len = ip.ihl * 4
+                header_len = (ip.ihl or 5) * 4
                 payload_len = len(ip.payload)
 
             pkt_len = len(pkt)
@@ -445,8 +485,29 @@ class NetworkScanner:
                 if tcp_layer is not None and tcp_layer.flags.S and not tcp_layer.flags.A:
                     _bruteforce_table[(src, dst, dport)]["attempts"] += 1
 
-        except Exception:
-            pass  # never crash the capture thread
+            _capture_stats["packets"] += 1
+            _capture_stats["last_packet"] = now
+        except Exception as e:
+            # never crash the capture thread — but don't hide the cause either
+            _capture_stats["errors"] += 1
+            if _capture_stats["errors"] <= 3:
+                logger.error("Packet handler error: %r", e)
+
+    @staticmethod
+    def capture_health() -> dict:
+        """Sniffer liveness: is it running, how many packets seen, how recently."""
+        last = _capture_stats["last_packet"]
+        return {
+            "scapy_available": SCAPY_AVAILABLE,
+            "capture_running": _capture_stats["started"],
+            "interface": _capture_stats["iface"],
+            "packets_seen": _capture_stats["packets"],
+            "handler_errors": _capture_stats["errors"],
+            "seconds_since_last_packet": round(time.time() - last, 1) if last else None,
+            "local_ip": LOCAL_IP,
+            "protected_ips": sorted(PROTECTED_IPS),
+            "tracked_flows": len(_flow_table),
+        }
 
     def drain_flows(self) -> list[dict]:
         """
@@ -459,7 +520,14 @@ class NetworkScanner:
 
         now = time.time()
         sensor_node_id = f"rpi4-{self.interface or 'eth0'}"
-        return [stats.to_feature_dict(now, sensor_node_id) for stats in snapshot.values()]
+        # <2 packets can't carry flow statistics; replies from this node itself
+        # (our own dashboard/SSH traffic) aren't attacker traffic.
+        return [
+            stats.to_feature_dict(now, sensor_node_id)
+            for stats in snapshot.values()
+            if (stats.fwd_pkts + stats.bwd_pkts) >= 2
+            and not (stats.initiator and stats.initiator[0] == LOCAL_IP)
+        ]
 
     def drain_burst_alerts(self) -> list[dict]:
         """
@@ -475,19 +543,27 @@ class NetworkScanner:
         1000-port nmap scan easily exceeds a "300 packets in 5s" flood
         threshold on total volume, which mislabeled real scans as floods.
         """
-        with _flow_lock:
-            snapshot = dict(_scan_table)
-            _scan_table.clear()
-
         now = time.time()
+        with _flow_lock:
+            snapshot = {k: dict(v, ports=set(v["ports"])) for k, v in _scan_table.items()}
+            # Entries stay live across drains (sliding window) so an attack is
+            # flagged as soon as it crosses a threshold, not at the window end.
+            for k, v in list(_scan_table.items()):
+                if now - v["start"] >= _TRACKER_WINDOW_SECONDS:
+                    del _scan_table[k]
+
         alerts = []
         for (src, dst), data in snapshot.items():
+            if src == LOCAL_IP:
+                continue
             n_ports = len(data["ports"])
             n_pkts = data["pkts"]
             window_s = round(now - data["start"], 1)
             avg_pkts_per_port = n_pkts / max(n_ports, 1)
 
             if n_ports >= _SCAN_PORT_THRESHOLD and avg_pkts_per_port < _SCAN_MAX_AVG_PKTS_PER_PORT:
+                if not self._cooldown_ok(("scan", src, dst), now):
+                    continue
                 confidence = min(n_ports / (_SCAN_PORT_THRESHOLD * 4), 1.0)
                 alerts.append({
                     "source_ip": src,
@@ -504,6 +580,8 @@ class NetworkScanner:
                     "timestamp": datetime.utcnow().isoformat(),
                 })
             elif n_pkts >= _FLOOD_PACKET_THRESHOLD:
+                if not self._cooldown_ok(("flood", src, dst), now):
+                    continue
                 confidence = min(n_pkts / (_FLOOD_PACKET_THRESHOLD * 4), 1.0)
                 alerts.append({
                     "source_ip": src,
@@ -519,7 +597,23 @@ class NetworkScanner:
                     ],
                     "timestamp": datetime.utcnow().isoformat(),
                 })
+        # Alerted entries restart their window so one attack isn't re-counted forever
+        with _flow_lock:
+            for a in alerts:
+                _scan_table.pop((a["source_ip"], a["dest_ip"]), None)
         return alerts
+
+    @staticmethod
+    def _cooldown_ok(key: tuple, now: float) -> bool:
+        """True (and records it) if `key` hasn't alerted within _HEURISTIC_COOLDOWN_SECONDS."""
+        with _flow_lock:
+            if now - _heuristic_last_alert.get(key, 0.0) < _HEURISTIC_COOLDOWN_SECONDS:
+                return False
+            _heuristic_last_alert[key] = now
+            if len(_heuristic_last_alert) > 2000:
+                for k in [k for k, t in _heuristic_last_alert.items() if now - t > 60]:
+                    del _heuristic_last_alert[k]
+            return True
 
     def drain_bruteforce_alerts(self) -> list[dict]:
         """
@@ -527,15 +621,21 @@ class NetworkScanner:
         dicts for any (src, dst, dst_port) that crossed
         _BRUTEFORCE_ATTEMPT_THRESHOLD fresh connection attempts in the window.
         """
-        with _flow_lock:
-            snapshot = dict(_bruteforce_table)
-            _bruteforce_table.clear()
-
         now = time.time()
+        with _flow_lock:
+            snapshot = {k: dict(v) for k, v in _bruteforce_table.items()}
+            for k, v in list(_bruteforce_table.items()):
+                if now - v["start"] >= _TRACKER_WINDOW_SECONDS:
+                    del _bruteforce_table[k]
+
         alerts = []
         for (src, dst, port), data in snapshot.items():
+            if src == LOCAL_IP:
+                continue
             attempts = data["attempts"]
             if attempts < _BRUTEFORCE_ATTEMPT_THRESHOLD:
+                continue
+            if not self._cooldown_ok(("bf", src, dst, port), now):
                 continue
             confidence = min(attempts / (_BRUTEFORCE_ATTEMPT_THRESHOLD * 4), 1.0)
             alerts.append({
@@ -552,6 +652,10 @@ class NetworkScanner:
                 ],
                 "timestamp": datetime.utcnow().isoformat(),
             })
+        with _flow_lock:
+            for a in alerts:
+                for k in [k for k in _bruteforce_table if k[0] == a["source_ip"] and k[1] == a["dest_ip"]]:
+                    del _bruteforce_table[k]
         return alerts
 
     # ── ARP Scan ──────────────────────────────────────────────────────────
@@ -750,31 +854,18 @@ class NetworkScanner:
             logger.debug("insert_alert (beacon flood) error: %s", e)
 
     def start_periodic_scan(self, interval: int = 60):
-        """Launch a daemon thread that refreshes ARP + WiFi SSID scan data every `interval` seconds."""
-        def _loop():
-            # Run initial scans immediately
-            try:
-                self.arp_scan()
-            except Exception as e:
-                logger.error("Initial ARP scan failed: %s", e)
-            try:
-                self.wifi_ssid_scan()
-            except Exception as e:
-                logger.error("Initial WiFi SSID scan failed: %s", e)
-
+        """Launch daemon threads that refresh ARP and WiFi SSID scan data every `interval` seconds."""
+        def _loop(fn, label):
             while True:
+                try:
+                    fn()
+                except Exception as e:
+                    logger.error("%s scan failed: %s", label, e)
                 time.sleep(interval)
-                try:
-                    self.arp_scan()
-                except Exception as e:
-                    logger.error("Periodic ARP scan failed: %s", e)
-                try:
-                    self.wifi_ssid_scan()
-                except Exception as e:
-                    logger.error("Periodic WiFi SSID scan failed: %s", e)
 
-        t = threading.Thread(target=_loop, daemon=True, name="arp-scanner")
-        t.start()
+        # Separate threads: nmcli's rescan can block ~15s and must not delay ARP
+        threading.Thread(target=_loop, args=(self.arp_scan, "ARP"), daemon=True, name="arp-scanner").start()
+        threading.Thread(target=_loop, args=(self.wifi_ssid_scan, "WiFi SSID"), daemon=True, name="wifi-scanner").start()
         logger.info("Periodic ARP + WiFi SSID scan started (interval=%ds)", interval)
 
     # ── Helpers ───────────────────────────────────────────────────────────

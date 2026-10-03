@@ -74,6 +74,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_alerts_ts    ON threat_alerts(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_alerts_class ON threat_alerts(threat_class);
         CREATE INDEX IF NOT EXISTS idx_alerts_src   ON threat_alerts(source_ip);
+        CREATE INDEX IF NOT EXISTS idx_alerts_id    ON threat_alerts(id DESC);
 
         CREATE TABLE IF NOT EXISTS iot_devices (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,11 +132,11 @@ def get_recent_alerts(limit: int = 20, threats_only: bool = False) -> list[dict]
         c.execute("""
             SELECT * FROM threat_alerts
             WHERE LOWER(threat_class) NOT IN ('benign', 'normal')
-            ORDER BY timestamp DESC LIMIT ?
+            ORDER BY id DESC LIMIT ?
         """, (limit,))
     else:
         c.execute(
-            "SELECT * FROM threat_alerts ORDER BY timestamp DESC LIMIT ?",
+            "SELECT * FROM threat_alerts ORDER BY id DESC LIMIT ?",
             (limit,)
         )
     rows = [dict(r) for r in c.fetchall()]
@@ -257,6 +258,30 @@ def prune_old_data(max_flows: int = 5000, max_alerts: int = 2000):
     conn.close()
 
 
+def insert_flows(flows: list[dict]):
+    """Insert many flows in one transaction (one connection, one commit)."""
+    if not flows:
+        return
+    now = datetime.utcnow().isoformat()
+    rows = [(
+        f.get("source_ip", "0.0.0.0"),
+        f.get("destination_ip", f.get("dest_ip", "0.0.0.0")),
+        float(f.get("flow_duration", 0)),
+        int(f.get("total_fwd_packets", 0)),
+        int(f.get("total_bwd_packets", 0)),
+        float(f.get("flow_bytes_per_sec", 0.0)),
+        now,
+    ) for f in flows]
+    conn = _get_conn()
+    conn.executemany("""
+        INSERT INTO network_flows
+            (source_ip, dest_ip, flow_duration, fwd_pkts, bwd_pkts, bytes_per_sec, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, rows)
+    conn.commit()
+    conn.close()
+
+
 def insert_flow(flow: dict):
     conn = _get_conn()
     conn.execute("""
@@ -290,6 +315,9 @@ def _get_local_ip() -> str:
         return "127.0.0.1"
 
 
+_LOCAL_IP = _get_local_ip()
+
+
 def get_stats() -> dict:
     """Aggregate KPI stats for the dashboard."""
     conn = _get_conn()
@@ -319,7 +347,7 @@ def get_stats() -> dict:
         SELECT source_ip, dest_ip, threat_class, confidence, detected_by, is_blocked, timestamp
         FROM threat_alerts
         WHERE LOWER(threat_class) NOT IN ('benign', 'normal')
-        ORDER BY timestamp DESC
+        ORDER BY id DESC
         LIMIT 1
     """)
     last_row = c.fetchone()
@@ -337,7 +365,7 @@ def get_stats() -> dict:
         "threats_blocked": total_blocked,
         "avg_confidence": avg_confidence,
         "last_alert": last_alert,
-        "rpi_ip": _get_local_ip(),
+        "rpi_ip": _LOCAL_IP,
         "uptime_seconds": uptime_s,
         "uptime_human": f"{hours:02d}:{minutes:02d}:{seconds:02d}",
         "monitoring": True,

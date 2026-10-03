@@ -30,7 +30,7 @@ from flask_cors import CORS
 
 import db
 from ml_engine import MLEngine
-from network_scanner import NetworkScanner
+from network_scanner import NetworkScanner, is_protected_ip
 
 # ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -48,7 +48,7 @@ CORS(app)
 db.init_db()
 
 ml = MLEngine()
-scanner = NetworkScanner()
+scanner = NetworkScanner(interface=os.environ.get("EDGE_IFACE") or None)
 
 # Pre-load all ML models in a background thread so the server starts instantly
 threading.Thread(target=ml.load, daemon=True, name="ml-loader").start()
@@ -83,6 +83,9 @@ def _iptables(action: str, ip: str) -> bool:
 
 
 def _block_ip(ip: str, reason: str = "auto", auto: bool = True):
+    if auto and is_protected_ip(ip):
+        logger.warning("Refusing to auto-block protected IP %s (%s)", ip, reason)
+        return
     _iptables("-A", ip)
     db.add_blocked_ip(ip, reason=reason, auto=auto)
     logger.info("Blocked %s (%s)", ip, reason)
@@ -96,31 +99,26 @@ def _unblock_ip(ip: str):
 
 # ── Classification Helper ─────────────────────────────────────────────────
 
+def _handle_result(result: dict):
+    """Persist a threat result, auto-block, and apply Zero Trust penalty."""
+    if result.get("threat_class", "Benign").lower() in ("benign", "normal"):
+        return
+    db.insert_alert(result)
+    ip = result["source_ip"]
+    if result.get("is_blocked") and not db.is_ip_blocked(ip):
+        _block_ip(ip, reason="auto", auto=True)
+
+    # Zero Trust: degrade this device's trust score
+    new_score = db.penalise_device(ip=ip, confidence=float(result.get("confidence", 0.5)))
+    if new_score is not None and new_score <= 0 and not db.is_ip_blocked(ip):
+        _block_ip(ip, reason="zero-trust-score", auto=True)
+
+
 def _classify_and_store(flow_data: dict) -> dict:
-    """Run ML pipeline, persist flow + alert, auto-block if needed."""
+    """Run ML pipeline on one flow, persist flow + alert, auto-block if needed."""
     result = ml.classify(flow_data)
-
-    # Always store the raw flow
     db.insert_flow(flow_data)
-
-    # Only store alerts for genuine threats (not Benign)
-    is_threat = result.get("threat_class", "Benign").lower() not in ("benign", "normal")
-    if is_threat:
-        db.insert_alert(result)
-        if result.get("is_blocked") and not db.is_ip_blocked(result["source_ip"]):
-            _block_ip(result["source_ip"], reason="auto", auto=True)
-
-        # Zero Trust: degrade this device's trust score
-        new_score = db.penalise_device(
-            ip=result["source_ip"],
-            confidence=float(result.get("confidence", 0.5)),
-        )
-        # If score just hit 0 the device is now auto-blocked in DB;
-        # also enforce the iptables rule if not already present
-        if new_score is not None and new_score <= 0:
-            if not db.is_ip_blocked(result["source_ip"]):
-                _block_ip(result["source_ip"], reason="zero-trust-score", auto=True)
-
+    _handle_result(result)
     return result
 
 
@@ -129,30 +127,59 @@ def _classify_and_store(flow_data: dict) -> dict:
 # Tunable via env — on a 4GB Pi 4, widening these spacings trades detection
 # latency for lower average CPU/IO load, since the same core budget is now
 # also shared with Chromium kiosk if it's running on-device.
-_FLOW_DRAIN_INTERVAL = int(os.environ.get("EDGE_FLOW_INTERVAL", "5"))
+_FLOW_DRAIN_INTERVAL = float(os.environ.get("EDGE_FLOW_INTERVAL", "2"))
+_HEURISTIC_INTERVAL  = float(os.environ.get("EDGE_HEURISTIC_INTERVAL", "1"))
 _ARP_SCAN_INTERVAL   = int(os.environ.get("EDGE_ARP_INTERVAL", "60"))
 _DB_PRUNE_INTERVAL   = int(os.environ.get("EDGE_DB_PRUNE_INTERVAL", "1800"))  # 30 min
 
 
+def _heuristic_loop():
+    """
+    Port scans, DDoS/floods, brute-force: deterministic heuristics (see
+    network_scanner.py trackers). Checked every second over a sliding window
+    so attacks surface within ~1s of crossing a threshold.
+    """
+    while True:
+        time.sleep(_HEURISTIC_INTERVAL)
+        try:
+            for result in scanner.drain_burst_alerts() + scanner.drain_bruteforce_alerts():
+                db.insert_alert(result)
+                ip = result["source_ip"]
+                if result.get("is_blocked") and not db.is_ip_blocked(ip):
+                    _block_ip(ip, reason="heuristic:" + result["detected_by"], auto=True)
+                db.penalise_device(ip=ip, confidence=float(result.get("confidence", 0.5)))
+        except Exception as e:
+            logger.error("Heuristic loop error: %s", e)
+
+
 def _flow_drain_loop():
-    """Drain captured flows from the sniffer every _FLOW_DRAIN_INTERVAL seconds, classify each."""
+    """Drain captured flows every _FLOW_DRAIN_INTERVAL seconds and classify them as one batch."""
     while True:
         time.sleep(_FLOW_DRAIN_INTERVAL)
         try:
             flows = scanner.drain_flows()
-            for flow in flows:
-                _classify_and_store(flow)
-
-            # Port scans, DDoS/floods, brute-force: detected by deterministic
-            # heuristics, not the ML pipeline (see network_scanner.py's
-            # tracker docstrings) — these arrive pre-formed, just persist +
-            # auto-block them.
-            for result in scanner.drain_burst_alerts() + scanner.drain_bruteforce_alerts():
-                db.insert_alert(result)
-                if result.get("is_blocked") and not db.is_ip_blocked(result["source_ip"]):
-                    _block_ip(result["source_ip"], reason="heuristic:" + result["detected_by"], auto=True)
+            if not flows:
+                continue
+            results = ml.classify_batch(flows)
+            db.insert_flows(flows)
+            for result in results:
+                _handle_result(result)
         except Exception as e:
             logger.error("Flow drain error: %s", e)
+
+
+def _health_log_loop():
+    """Every 15s log packets seen — makes a dead sniffer obvious in the console."""
+    last = 0
+    while True:
+        time.sleep(15)
+        h = scanner.capture_health()
+        logger.info("capture: running=%s iface=%s packets=%d (+%d) errors=%d flows=%d",
+                    h["capture_running"], h["interface"], h["packets_seen"],
+                    h["packets_seen"] - last, h["handler_errors"], h["tracked_flows"])
+        if h["capture_running"] and h["packets_seen"] == last:
+            logger.warning("No packets captured in 15s — wrong interface? try EDGE_IFACE=wlan0 or eth0")
+        last = h["packets_seen"]
 
 
 def _db_prune_loop():
@@ -180,6 +207,15 @@ def _start_background_threads():
         name="flow-drain",
     ).start()
 
+    # 2b. Heuristic (scan/flood/brute-force) detection — 1s cadence
+    threading.Thread(
+        target=_heuristic_loop,
+        daemon=True,
+        name="heuristics",
+    ).start()
+
+    threading.Thread(target=_health_log_loop, daemon=True, name="health-log").start()
+
     # 3. Periodic ARP scan
     scanner.start_periodic_scan(interval=_ARP_SCAN_INTERVAL)
 
@@ -201,6 +237,20 @@ _start_background_threads()
 def index():
     """Serve the TFT frontend SPA."""
     return send_from_directory("static", "index.html")
+
+
+@app.route("/api/health")
+def api_health():
+    """Capture/ML liveness — first stop when detection looks dead."""
+    return jsonify({
+        "capture": scanner.capture_health(),
+        "ml_loaded": ml._loaded,
+        "ml_stages": {
+            "tree_ensemble": ml.xgb is not None and ml.rf is not None,
+            "autoencoder": ml.autoencoder is not None,
+            "bilstm": ml.bilstm is not None,
+        },
+    })
 
 
 @app.route("/api/stats")
@@ -350,7 +400,6 @@ def api_iot_block(mac: str):
     Manually block a device by MAC address.
     Looks up the device’s current IP and adds an iptables DROP rule.
     """
-    device = db.get_device_by_ip.__module__  # verify db is reachable
     devices = db.get_iot_devices()
     target  = next((d for d in devices if d["mac"] == mac), None)
 

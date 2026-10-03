@@ -79,6 +79,18 @@ _KEY_MAP = {
 }
 
 _AUTO_BLOCK_THRESHOLD = 0.85
+_TREE_PROB_THRESHOLD = float(os.environ.get("EDGE_TREE_THRESHOLD", "0.6"))  # mean P(malicious) needed
+
+
+def _tree_verdict(x: float, r: float) -> float:
+    """
+    Soft-vote XGBoost + RF: flag when the mean probability clears the
+    threshold AND neither tree strongly disagrees (min >= 0.3). Strict
+    "both > 0.5" missed floods where RF sat at ~0.58 while XGB said 0.99.
+    Returns the mean probability (the confidence) or 0.0 for benign.
+    """
+    mean = (x + r) / 2
+    return mean if (mean >= _TREE_PROB_THRESHOLD and min(x, r) >= 0.3) else 0.0
 _AUTOENCODER_MSE_THRESHOLD = 50.0
 _BILSTM_PROB_THRESHOLD = 0.98
 
@@ -317,7 +329,50 @@ class MLEngine:
 
     # ── Classification ─────────────────────────────────────────────────────
 
-    def classify(self, flow_data: dict) -> dict:
+    def classify_batch(self, flows: list[dict]) -> list[dict]:
+        """
+        Classify many flows with ONE xgb/rf predict call over the whole matrix
+        (per-call overhead dominates for single rows); deep stages then run
+        per flow only on flows the trees called benign.
+        """
+        if not flows:
+            return []
+        if not self._loaded:
+            self.load()
+        if self.feature_columns is None or self.scaler is None or self.xgb is None or self.rf is None:
+            return [self.classify(f) for f in flows]
+
+        prepared = []
+        for f in flows:
+            try:
+                prepared.append(self._prepare_features(f))
+            except Exception as e:
+                logger.error("Feature preparation failed: %s", e)
+                prepared.append(None)
+
+        ok_idx = [i for i, p in enumerate(prepared) if p is not None]
+        flags = {}
+        if ok_idx:
+            try:
+                mat = np.vstack([prepared[i][0] for i in ok_idx])
+                xp = self.xgb.predict_proba(mat)[:, 1]
+                rp = self.rf.predict_proba(mat)[:, 1]
+                # Consensus: both trees must call it malicious; confidence is the
+                # mean of their real probabilities (not a hard-coded constant).
+                flags = {
+                    i: _tree_verdict(float(x), float(r))
+                    for i, x, r in zip(ok_idx, xp, rp)
+                }
+            except Exception as e:
+                logger.error("Batch tree prediction failed: %s", e)
+                return [self.classify(f) for f in flows]
+
+        return [
+            self.classify(f, _tree_hit=flags.get(i), _prepared=prepared[i])
+            for i, f in enumerate(flows)
+        ]
+
+    def classify(self, flow_data: dict, _tree_hit=None, _prepared=None) -> dict:
         """
         Run the 3-stage cascade on `flow_data` and return a structured result dict.
 
@@ -347,7 +402,7 @@ class MLEngine:
             return result
 
         try:
-            scaled_fv, raw_values = self._prepare_features(flow_data)
+            scaled_fv, raw_values = _prepared if _prepared is not None else self._prepare_features(flow_data)
         except Exception as e:
             logger.error("Feature preparation failed: %s", e)
             return result
@@ -357,12 +412,14 @@ class MLEngine:
         # ── Stage 1: Tree Ensemble ──────────────────────────────────────
         if self.xgb is not None and self.rf is not None:
             try:
-                xgb_pred = int(self.xgb.predict(scaled_fv)[0])
-                rf_pred  = int(self.rf.predict(scaled_fv)[0])
-                if xgb_pred == 1 and rf_pred == 1:
+                if _tree_hit is None:
+                    x = float(self.xgb.predict_proba(scaled_fv)[0][1])
+                    r = float(self.rf.predict_proba(scaled_fv)[0][1])
+                    _tree_hit = _tree_verdict(x, r)
+                if _tree_hit:
                     result["threat_class"] = "Malicious"
                     result["detected_by"]  = "Tree Ensemble"
-                    result["confidence"]   = 0.99
+                    result["confidence"]   = round(float(_tree_hit), 4)
             except Exception as e:
                 logger.error("Stage 1 (Tree Ensemble) failed: %s", e)
 

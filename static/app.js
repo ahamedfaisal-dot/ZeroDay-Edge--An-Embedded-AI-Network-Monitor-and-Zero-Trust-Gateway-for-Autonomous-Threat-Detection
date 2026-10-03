@@ -80,7 +80,7 @@ function threatColour(cls) {
 
 async function fetchJSON(url) {
   try {
-    const r = await fetch(url);
+    const r = await fetch(url, { cache: 'no-store' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   } catch (e) {
@@ -483,9 +483,18 @@ function renderXai(data) {
 /* POLLING INTERVALS                                                       */
 /* ══════════════════════════════════════════════════════════════════════ */
 
+const _polling = {};
+function guarded(name, fn) {
+  // Skip a tick if the previous one is still in flight (slow Pi / big DB)
+  return async () => {
+    if (_polling[name]) return;
+    _polling[name] = true;
+    try { await fn(); } finally { _polling[name] = false; }
+  };
+}
+
 async function pollDashboard() {
-  await fetchStats();
-  await fetchDashboardFeed();
+  await Promise.all([fetchStats(), fetchDashboardFeed()]);
 }
 
 async function pollAlerts() {
@@ -498,11 +507,11 @@ pollAlerts();
 fetchBlocked();
 
 // Recurring polls
-setInterval(pollDashboard, 4000);   // stats + mini feed every 4 s
-setInterval(pollAlerts,    8000);   // alerts list every 8 s
-setInterval(fetchBlocked,  10000);  // blocked IPs every 10 s
+setInterval(guarded('dash',    pollDashboard), 1000);  // stats + mini feed
+setInterval(guarded('alerts',  pollAlerts),    1500);  // alerts list
+setInterval(guarded('blocked', fetchBlocked),  2000);  // blocked IPs
 
 // Network page auto-refresh when visible
-setInterval(() => {
-  if (activePage === 'network') fetchNetwork();
-}, 30000);
+setInterval(guarded('net', async () => {
+  if (activePage === 'network') await fetchNetwork();
+}), 10000);
