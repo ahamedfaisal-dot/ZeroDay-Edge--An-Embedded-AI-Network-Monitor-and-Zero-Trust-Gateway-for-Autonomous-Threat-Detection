@@ -75,6 +75,31 @@ threading.Thread(target=ml.load, daemon=True, name="ml-loader").start()
 
 # ── iptables Helpers ──────────────────────────────────────────────────────
 
+def _ensure_safeguard_rules():
+    """
+    Ensure management ports (Dashboard :5000 and SSH :22) are explicitly ACCEPTed
+    at the very top of iptables INPUT chain so an auto-block on an attacker IP
+    (especially during demos run from the operator's PC) never severs the dashboard
+    or SSH session!
+    """
+    flask_port = os.environ.get("EDGE_PORT", "5000")
+    for port in (flask_port, "22"):
+        try:
+            cmd_check = ["iptables", "-C", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"]
+            cmd_insert = ["iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"]
+            if hasattr(os, "geteuid") and os.geteuid() != 0:
+                p = subprocess.run(["sudo", "-S"] + cmd_check, input=b"pi\n", capture_output=True)
+                if p.returncode != 0:
+                    subprocess.run(["sudo", "-S"] + cmd_insert, input=b"pi\n", capture_output=True)
+            else:
+                p = subprocess.run(cmd_check, capture_output=True)
+                if p.returncode != 0:
+                    subprocess.run(cmd_insert, capture_output=True)
+        except Exception as e:
+            logger.debug("Safeguard rule error: %s", e)
+
+_ensure_safeguard_rules()
+
 def _iptables(action: str, ip: str) -> bool:
     """
     Add or remove an iptables INPUT DROP rule for `ip`.
